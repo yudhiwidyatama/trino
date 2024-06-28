@@ -87,6 +87,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -272,6 +273,12 @@ public class OracleClient
     }
 
     @Override
+    public Map<String, Object> getTableProperties(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        return super.getTableProperties(session, tableHandle);
+    }
+
+    @Override
     protected boolean filterSchema(String schemaName)
     {
         if (INTERNAL_SCHEMAS.contains(schemaName.toLowerCase(ENGLISH))) {
@@ -374,10 +381,35 @@ public class OracleClient
     @Override
     protected List<String> createTableSqls(RemoteTableName remoteTableName, List<String> columns, ConnectorTableMetadata tableMetadata)
     {
-        checkArgument(tableMetadata.getProperties().isEmpty(), "Unsupported table properties: %s", tableMetadata.getProperties());
+        //checkArgument(tableMetadata.getProperties().isEmpty(), "Unsupported table properties: %s", tableMetadata.getProperties());
+        java.util.Set<String> propKeys0 = tableMetadata.getProperties().keySet();
+        HashSet<String> propKeys = new HashSet<String>(propKeys0);
+        if (propKeys.contains("index")) {
+            propKeys.remove("index");
+        }
+        checkArgument(propKeys.isEmpty(), "Unsupported table properties: %s", propKeys.toString());
         ImmutableList.Builder<String> createTableSqlsBuilder = ImmutableList.builder();
         createTableSqlsBuilder.add(format("CREATE TABLE %s (%s)", quoted(remoteTableName), join(", ", columns)));
         Optional<String> tableComment = tableMetadata.getComment();
+        if (tableMetadata.getProperties().containsKey("index")) {
+            List<String> indexspecs = (List<String>) tableMetadata.getProperties().get("index");
+            for (String indexSpec : indexspecs) {
+                int pos1 = indexSpec.indexOf("(");
+                int pos2 = indexSpec.indexOf(")");
+                if ((pos1 < 0) || (pos2 < 0)) {
+                    new TrinoException(JDBC_ERROR, "" +
+                            "Index spec invalid format, expected indexname(col1,col2,...) but found "
+                            + indexSpec);
+                }
+                String indexColumns = indexSpec.substring(pos1, pos2);
+                String indexName = indexSpec.substring(0, pos1 - 1);
+                createTableSqlsBuilder.add(
+                        format("CREATE INDEX %s ON %s(%s)",
+                                quoted(indexName),
+                                quoted(remoteTableName),
+                                indexColumns));
+            }
+        }
         if (tableComment.isPresent()) {
             createTableSqlsBuilder.add(buildTableCommentSql(remoteTableName, tableComment));
         }
