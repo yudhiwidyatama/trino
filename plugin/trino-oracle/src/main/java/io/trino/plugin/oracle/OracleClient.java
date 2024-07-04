@@ -397,12 +397,12 @@ public class OracleClient
                 int pos1 = indexSpec.indexOf("(");
                 int pos2 = indexSpec.indexOf(")");
                 if ((pos1 < 0) || (pos2 < 0)) {
-                    new TrinoException(JDBC_ERROR, "" +
+                    throw new TrinoException(JDBC_ERROR, "" +
                             "Index spec invalid format, expected indexname(col1,col2,...) but found "
                             + indexSpec);
                 }
-                String indexColumns = indexSpec.substring(pos1, pos2);
-                String indexName = indexSpec.substring(0, pos1 - 1);
+                String indexColumns = indexSpec.substring(pos1 + 1, pos2);
+                String indexName = indexSpec.substring(0, pos1);
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
                                 quoted(indexName),
