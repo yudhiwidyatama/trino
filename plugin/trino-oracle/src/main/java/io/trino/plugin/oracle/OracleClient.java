@@ -78,6 +78,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -903,5 +904,24 @@ public class OracleClient
     public void dropNotNullConstraint(ConnectorSession session, JdbcTableHandle handle, JdbcColumnHandle column)
     {
         throw new TrinoException(NOT_SUPPORTED, "This connector does not support dropping a not null constraint");
+    }
+
+    public void gatherTableStats(ConnectorSession session, String schemaName, String tableName)
+    {
+        String sql = "BEGIN DBMS_STATS.GATHER_TABLE_STATS('" + schemaName + "', '" + tableName + "'); END;";
+        try (Connection connection = connectionFactory.openConnection(session)) {
+            try (Statement statement = connection.createStatement()) {
+                String modifiedQuery = queryModifier.apply(session, sql);
+                //log.debug("Execute: %s", modifiedQuery);
+                statement.execute(modifiedQuery);
+            }
+            catch (SQLException e) {
+                e.addSuppressed(new RuntimeException("Query: " + sql));
+                throw e;
+            }
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
     }
 }
