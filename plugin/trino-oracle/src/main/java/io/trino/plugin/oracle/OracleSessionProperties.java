@@ -23,6 +23,7 @@ import java.math.RoundingMode;
 import java.util.List;
 import java.util.Optional;
 
+import static io.trino.spi.session.PropertyMetadata.booleanProperty;
 import static io.trino.spi.session.PropertyMetadata.enumProperty;
 import static io.trino.spi.session.PropertyMetadata.integerProperty;
 
@@ -49,6 +50,15 @@ public final class OracleSessionProperties
                         "Default scale for Oracle Number data type",
                         config.getDefaultNumberScale().orElse(null),
                         false))
+                .add(booleanProperty(
+                        "experimental_split",
+                        "Experimental split",
+                        config.getExperimentalSplit(), false))
+                .add(integerProperty(
+                        "split_stride",
+                        "Default scale for Oracle Number data type",
+                        config.getSplitStride(),
+                        false))
                 .build();
     }
 
@@ -56,6 +66,16 @@ public final class OracleSessionProperties
     public List<PropertyMetadata<?>> getSessionProperties()
     {
         return sessionProperties;
+    }
+
+    public static Boolean getExperimentalSplit(ConnectorSession session)
+    {
+        return session.getProperty("experimental_split", Boolean.class);
+    }
+
+    public static Integer getSplitStride(ConnectorSession session)
+    {
+        return session.getProperty("split_stride", Integer.class);
     }
 
     public static RoundingMode getNumberRoundingMode(ConnectorSession session)

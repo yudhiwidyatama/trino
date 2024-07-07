@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
+import io.airlift.log.Logger;
 import io.trino.plugin.base.aggregation.AggregateFunctionRewriter;
 import io.trino.plugin.base.aggregation.AggregateFunctionRule;
 import io.trino.plugin.base.expression.ConnectorExpressionRewriter;
@@ -30,6 +31,8 @@ import io.trino.plugin.jdbc.DoubleWriteFunction;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcExpression;
 import io.trino.plugin.jdbc.JdbcJoinCondition;
+import io.trino.plugin.jdbc.JdbcNamedRelationHandle;
+import io.trino.plugin.jdbc.JdbcSplit;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongReadFunction;
@@ -60,7 +63,9 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.type.CharType;
@@ -88,13 +93,17 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.emptyToNull;
@@ -156,6 +165,7 @@ import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.lang.String.join;
 import static java.util.Locale.ENGLISH;
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.DAYS;
 
 public class OracleClient
@@ -922,6 +932,205 @@ public class OracleClient
         }
         catch (SQLException e) {
             throw new TrinoException(JDBC_ERROR, e);
+        }
+    }
+
+    @Override
+    public ConnectorSplitSource getSplits(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        if (!OracleSessionProperties.getExperimentalSplit(session)) {
+            return super.getSplits(session, tableHandle);
+        }
+        Optional<List<RangeInfo>> splitRanges = getSplitRanges(session, tableHandle);
+        if (!splitRanges.isPresent()) {
+            return super.getSplits(session, tableHandle);
+        }
+        List<RangeInfo> splitRange1 = splitRanges.get();
+        if (splitRange1.isEmpty()) {
+            return super.getSplits(session, tableHandle);
+        }
+        List<JdbcSplit> splits = splitRange1.stream()
+                .map(OracleClient::convertRangeInfoIntoPredicate)
+                .map(x -> new JdbcSplit(Optional.of(x)))
+                .collect(Collectors.toList());
+        return new FixedSplitSource(splits);
+    }
+
+    static String convertRangeInfoIntoPredicate(RangeInfo rangeInfo)
+    {
+        StringBuilder sql = new StringBuilder();
+        String expression = rangeInfo.getExpression();
+        if (rangeInfo.getLowerBound().isPresent()) {
+            sql.append(expression).append(" >= ").append(rangeInfo.getLowerBound().get());
+        }
+
+        if (rangeInfo.getUpperBound().isPresent()) {
+            if (rangeInfo.getLowerBound().isPresent()) {
+                sql.append(" AND ");
+            }
+            sql.append(expression).append(" < ").append(rangeInfo.getUpperBound().get());
+        }
+
+        return sql.toString();
+    }
+
+    public Optional<List<RangeInfo>> getSplitRanges(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        Logger log = Logger.get(OracleClient.class);
+        Map<String, List<String>> masterIndex = new HashMap<>();
+        Optional<List<RangeInfo>> result = Optional.empty();
+        log.info("getSplitRanges: for " + tableHandle.toString());
+        if (!(tableHandle.getRelationHandle() instanceof JdbcNamedRelationHandle)) {
+            log.info("getting split range not namedrelationhandle => " + tableHandle.getRelationHandle().toString());
+            return result;
+        }
+        JdbcNamedRelationHandle tableRelationHandle = (JdbcNamedRelationHandle) tableHandle.getRelationHandle();
+        log.info("getting split range => " + tableRelationHandle.toString());
+        String sql = "select index_name, table_owner, column_name, column_position from all_ind_columns where table_owner=? and table_name=?";
+        Connection connection = null;
+        try {
+            connection = getConnection(session, null, tableHandle);
+            PreparedStatement preparedStatement = connection.prepareStatement(sql);
+            preparedStatement.setString(1, tableRelationHandle.getSchemaTableName().getSchemaName());
+            preparedStatement.setString(2, tableRelationHandle.getSchemaTableName().getTableName());
+            ResultSet rs = preparedStatement.executeQuery();
+            while (rs.next()) {
+                String indexName = rs.getString(1);
+                if (!masterIndex.containsKey(indexName)) {
+                    masterIndex.put(indexName, new ArrayList<>());
+                }
+                masterIndex.get(indexName).add(rs.getString(3));
+            }
+            String columnPart = null;
+            for (Map.Entry<String, List<String>> entry : masterIndex.entrySet()) {
+                if (entry.getValue().size() == 1) {
+                    String theColumn = entry.getValue().get(0);
+                    if (theColumn.equalsIgnoreCase("ROWNO")) {
+                        columnPart = theColumn;
+                    }
+                }
+            }
+            if (columnPart == null) {
+                for (Map.Entry<String, List<String>> entry : masterIndex.entrySet()) {
+                    if (entry.getValue().size() == 1) {
+                        columnPart = entry.getValue().get(0);
+                    }
+                }
+            }
+            if (columnPart == null) {
+                return result;
+            }
+            rs.close();
+            preparedStatement.close();
+            String sql2 = "SELECT MIN(" + columnPart
+                    + ") MINV, MAX(" + columnPart + ") MAXV FROM " + tableRelationHandle.getSchemaTableName().getSchemaName()
+                     + "." + tableRelationHandle.getSchemaTableName().getTableName();
+            preparedStatement = connection.prepareStatement(sql2);
+            ResultSet rs2 = preparedStatement.executeQuery();
+            while (rs2.next()) {
+                Object ob1 = rs2.getObject(1);
+                if (ob1 == null) {
+                    return result;
+                }
+                ob1 = rs2.getObject(2);
+                if (ob1 == null) {
+                    return result;
+                }
+                int minVal = rs2.getInt(1);
+                int maxVal = rs2.getInt(2);
+                int curPos = minVal;
+                int stride = OracleSessionProperties.getSplitStride(session);
+                List<RangeInfo> result1 = new ArrayList<>();
+                Optional<Integer> lowerBound = Optional.empty();
+                Optional<Integer> upperBound = Optional.of(curPos + stride);
+                result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
+                curPos += stride;
+                while (curPos < maxVal) {
+                    lowerBound = upperBound;
+                    upperBound = Optional.of(curPos + stride);
+                    result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
+                }
+                result = Optional.of(result1);
+            }
+            rs2.close();
+            return result;
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+        finally {
+            if (connection != null) {
+                try {
+                    connection.close();
+                }
+                catch (Exception ex) {
+                }
+            }
+        }
+    }
+
+    public static class RangeInfo
+    {
+        private final String expression;
+        /**
+         * The lower bound of the range (included)
+         */
+        private final Optional<Integer> lowerBound;
+        /**
+         * The upper bound of the range (not include the upperBond itself)
+         */
+        private final Optional<Integer> upperBound;
+
+        public RangeInfo(String expression, Optional<Integer> lowerBound, Optional<Integer> upperBound)
+        {
+            this.expression = requireNonNull(expression, "expression is null");
+            this.lowerBound = requireNonNull(lowerBound, "lowerBound is null");
+            this.upperBound = requireNonNull(upperBound, "upperBound is null");
+        }
+
+        public String getExpression()
+        {
+            return expression;
+        }
+
+        public Optional<Integer> getLowerBound()
+        {
+            return lowerBound;
+        }
+
+        public Optional<Integer> getUpperBound()
+        {
+            return upperBound;
+        }
+
+        @Override
+        public boolean equals(Object obj)
+        {
+            if (this == obj) {
+                return true;
+            }
+
+            if (obj == null || getClass() != obj.getClass()) {
+                return false;
+            }
+
+            RangeInfo that = (RangeInfo) obj;
+
+            return Objects.equals(this.expression, that.expression)
+                    && Objects.equals(this.lowerBound, that.lowerBound)
+                    && Objects.equals(this.upperBound, that.upperBound);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(expression, lowerBound, upperBound);
+        }
+
+        @Override
+        public String toString()
+        {
+            return "[" + lowerBound + ", " + upperBound + ")";
         }
     }
 }
