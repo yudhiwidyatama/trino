@@ -80,7 +80,7 @@ public class GatherStatsProvider
             callableStatement.execute();
             callableStatement.close();
             connection.close();
-            log.info("GatherStatsProvider: " + sql );
+            log.info("GatherStatsProvider: " + sql);
         }
         catch (SQLException e) {
             throw new TrinoException(JDBC_ERROR, e);

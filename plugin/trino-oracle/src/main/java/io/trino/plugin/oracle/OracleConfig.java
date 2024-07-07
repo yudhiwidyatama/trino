@@ -38,11 +38,37 @@ public class OracleConfig
     private int connectionPoolMinSize = 1;
     private int connectionPoolMaxSize = 30;
     private Duration inactiveConnectionTimeout = new Duration(20, MINUTES);
+    private int splitStride = 1000;
+    private boolean experimentalSplit = true;
 
     @NotNull
     public boolean isSynonymsEnabled()
     {
         return synonymsEnabled;
+    }
+
+    public int getSplitStride()
+    {
+        return splitStride;
+    }
+
+    public boolean getExperimentalSplit()
+    {
+        return experimentalSplit;
+    }
+
+    @Config("oracle.split.stride")
+    public OracleConfig setSplitStride(int num)
+    {
+        this.splitStride = num;
+        return this;
+    }
+
+    @Config("oracle.experimental.split")
+    public OracleConfig setExperimentalSplit(boolean split)
+    {
+        this.experimentalSplit = true;
+        return this;
     }
 
     @Config("oracle.synonyms.enabled")
