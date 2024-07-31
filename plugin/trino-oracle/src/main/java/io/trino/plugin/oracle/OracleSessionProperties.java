@@ -26,6 +26,7 @@ import java.util.Optional;
 import static io.trino.spi.session.PropertyMetadata.booleanProperty;
 import static io.trino.spi.session.PropertyMetadata.enumProperty;
 import static io.trino.spi.session.PropertyMetadata.integerProperty;
+import static io.trino.spi.session.PropertyMetadata.stringProperty;
 
 public final class OracleSessionProperties
         implements SessionPropertiesProvider
@@ -59,6 +60,11 @@ public final class OracleSessionProperties
                         "Default scale for Oracle Number data type",
                         config.getSplitStride(),
                         false))
+                .add(stringProperty(
+                        "split_rule",
+                        "Splitting rule",
+                        config.getSplitRule(),
+                        false))
                 .build();
     }
 
@@ -71,6 +77,11 @@ public final class OracleSessionProperties
     public static Boolean getExperimentalSplit(ConnectorSession session)
     {
         return session.getProperty("experimental_split", Boolean.class);
+    }
+
+    public static String getSplitRule(ConnectorSession session)
+    {
+        return session.getProperty("split_rule", String.class);
     }
 
     public static Integer getSplitStride(ConnectorSession session)
