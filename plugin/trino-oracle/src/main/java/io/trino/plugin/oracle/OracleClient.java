@@ -32,6 +32,8 @@ import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcExpression;
 import io.trino.plugin.jdbc.JdbcJoinCondition;
 import io.trino.plugin.jdbc.JdbcNamedRelationHandle;
+import io.trino.plugin.jdbc.JdbcQueryRelationHandle;
+import io.trino.plugin.jdbc.JdbcRelationHandle;
 import io.trino.plugin.jdbc.JdbcSplit;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
@@ -39,6 +41,7 @@ import io.trino.plugin.jdbc.LongReadFunction;
 import io.trino.plugin.jdbc.LongWriteFunction;
 import io.trino.plugin.jdbc.ObjectReadFunction;
 import io.trino.plugin.jdbc.ObjectWriteFunction;
+import io.trino.plugin.jdbc.PreparedQuery;
 import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.RemoteTableName;
 import io.trino.plugin.jdbc.SliceWriteFunction;
@@ -67,6 +70,8 @@ import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.connector.JoinCondition;
+import io.trino.spi.connector.JoinStatistics;
+import io.trino.spi.connector.JoinType;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
@@ -102,6 +107,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.StringTokenizer;
+import java.util.WeakHashMap;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
@@ -961,38 +968,222 @@ public class OracleClient
         StringBuilder sql = new StringBuilder();
         String expression = rangeInfo.getExpression();
         if (rangeInfo.getLowerBound().isPresent()) {
-            sql.append(expression).append(" >= ").append(rangeInfo.getLowerBound().get());
+            if (rangeInfo.getLowerBound().get() instanceof Number) {
+                sql.append(expression).append(" >= ").append(rangeInfo.getLowerBound().get());
+            }
+            else {
+                sql.append(expression).append(" >= '").append(rangeInfo.getLowerBound().get()).append("'");
+            }
         }
 
         if (rangeInfo.getUpperBound().isPresent()) {
             if (rangeInfo.getLowerBound().isPresent()) {
                 sql.append(" AND ");
             }
-            sql.append(expression).append(" < ").append(rangeInfo.getUpperBound().get());
+            var upperOperator = " < ";
+            if (rangeInfo.isUpperInclusive()) {
+                upperOperator = " <= ";
+            }
+            if (rangeInfo.getUpperBound().get() instanceof Number) {
+                sql.append(expression).append(upperOperator).append(rangeInfo.getUpperBound().get());
+            }
+            else {
+                sql.append(expression).append(upperOperator).append("'").append(rangeInfo.getUpperBound().get()).append("'");
+            }
         }
 
         return sql.toString();
     }
 
-    public Optional<List<RangeInfo>> getSplitRanges(ConnectorSession session, JdbcTableHandle tableHandle)
+    Optional<List<RangeInfo>> getSplitRangesFromPrepQuery(Connection connection, PreparedQuery query, JdbcTableHandle tableHandle, SplittingRule rule)
     {
         Logger log = Logger.get(OracleClient.class);
-        Map<String, List<String>> masterIndex = new HashMap<>();
-        Optional<List<RangeInfo>> result = Optional.empty();
-        log.info("getSplitRanges: for " + tableHandle.toString());
-        if (!(tableHandle.getRelationHandle() instanceof JdbcNamedRelationHandle)) {
-            log.info("getting split range not namedrelationhandle => " + tableHandle.getRelationHandle().toString());
-            return result;
+        if (!queryToInfo.containsKey(query)) {
+            log.info("QueryEnhancedInfo not found in cache : " + query.toString());
+            return Optional.empty();
         }
-        JdbcNamedRelationHandle tableRelationHandle = (JdbcNamedRelationHandle) tableHandle.getRelationHandle();
+        var queryInfo = queryToInfo.get(query);
+        return getSplitRangesFromQueryInfo(connection, queryInfo, rule);
+    }
+
+    private Optional<List<RangeInfo>> getSplitRangesFromQueryInfo(Connection connection, QueryEnhancedInfo queryInfo, SplittingRule rule)
+    {
+        Logger log = Logger.get(OracleClient.class);
+        if (queryInfo == null) {
+            return Optional.empty();
+        }
+        if (queryInfo.isNamedRelation) {
+            return getRangeInfos(queryInfo.namedRelation, connection, rule);
+        }
+        else {
+            if (queryInfo.isJoin) {
+                Optional<List<RangeInfo>> rightRange = getSplitRangesFromQueryInfo(connection, queryInfo.rightInfo, rule);
+                // heuristic : choose non-blank range
+                //if (leftRange.isEmpty()) {
+                //    return adjustRange(rightRange, queryInfo.rightProjections);
+                //}
+                if (rightRange.isEmpty()) {
+                    Optional<List<RangeInfo>> leftRange = getSplitRangesFromQueryInfo(connection, queryInfo.leftInfo, rule);
+                    return adjustRange(leftRange, queryInfo.leftProjections);
+                }
+                return adjustRange(rightRange, queryInfo.rightProjections);
+                // heuristic : choose build-side (right-side) partitioning
+            }
+            else {
+                log.info("unknown query info, should be <<FATAL>> ");
+                return Optional.empty();
+            }
+        }
+    }
+
+    private Optional<List<RangeInfo>> adjustRange(Optional<List<RangeInfo>> rangeInfoList, Map<JdbcColumnHandle, String> projections)
+    {
+        if (rangeInfoList.isEmpty() || (rangeInfoList.get().size() == 0)) {
+            return rangeInfoList; // if empty, do nothing
+        }
+        var rangeInfoList1 = rangeInfoList.get();
+        var firstRange = rangeInfoList1.get(0);
+        var columnPart = firstRange.expression;
+        for (var key : projections.keySet()) {
+            if (key.getColumnName().equalsIgnoreCase(columnPart)) {
+                // bingo
+                columnPart = projections.get(key);
+                break;
+            }
+        }
+
+        for (int i = 0; i < rangeInfoList1.size(); i++) {
+            var range = rangeInfoList1.get(i);
+            rangeInfoList1.set(i, new RangeInfo(columnPart, range.getLowerBound(), range.getUpperBound()));
+            // replace elements
+        }
+        return rangeInfoList; // which contract did I break?
+    }
+
+    public Optional<List<RangeInfo>> getSplitRanges(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        Logger log0 = Logger.get(OracleClient.class);
+        Optional<List<RangeInfo>> result0 = Optional.empty();
+        log0.info("getSplitRanges: for " + tableHandle.toString());
+        Connection connection = null;
+        String splitRule = OracleSessionProperties.getSplitRule(session);
+        int stride = OracleSessionProperties.getSplitStride(session);
+        var rules = parseRules(splitRule, stride);
+        connection = getConnectionForTableHandle(session, tableHandle, connection, log0);
+        if (connection == null) {
+            log0.info(" unable to get connection in getSplitRanges ");
+            return Optional.empty();
+        }
+
+        if (!(tableHandle.getRelationHandle() instanceof JdbcNamedRelationHandle)) {
+            JdbcRelationHandle relationHandle = tableHandle.getRelationHandle();
+            if (relationHandle instanceof JdbcQueryRelationHandle) {
+                var queryHandle = (JdbcQueryRelationHandle) relationHandle;
+                var preparedQuery = queryHandle.getPreparedQuery();
+                result0 = getSplitRangesFromPrepQuery(connection, preparedQuery, tableHandle, rules);
+            }
+            else {
+                log0.info("unknown relationHandle  => " + relationHandle.toString());
+            }
+            return result0;
+        }
+
+        JdbcNamedRelationHandle tableRelationHandle = tableHandle.getRequiredNamedRelation();
+
+        var rangeInfos = getRangeInfos(tableRelationHandle, connection, rules);
+        try {
+            connection.close();
+        }
+        catch (Exception ex) {
+            // ignore exception
+        }
+        return rangeInfos;
+    }
+
+    private Optional<List<RangeInfo>> getRangeInfos(JdbcNamedRelationHandle tableRelationHandle, Connection connection, SplittingRule rules)
+    {
+        var thisTableName = tableRelationHandle.getSchemaTableName().getTableName();
+        for (SplittingRule.Rule r : rules.rules) {
+            boolean tableNameMatch = r.isAnyTable() ||
+                    r.tableName
+                    .equalsIgnoreCase(thisTableName);
+            if (!tableNameMatch) {
+                continue;
+            }
+            switch (r.ruleType) {
+                case SplittingRule.RuleType.ROWID:
+                    return getRangeInfosRowid(tableRelationHandle, connection, r.partitions);
+                case SplittingRule.RuleType.INDEX:
+                    return getRangeInfosIntegerIndex(tableRelationHandle, connection, r.stride, r.colOrIdx);
+                case SplittingRule.RuleType.NTILE:
+                    return getRangeInfosNtileIndex(tableRelationHandle, connection, r.partitions, r.colOrIdx);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static SplittingRule parseRules(String splitRule, int stride)
+    {
+        var rules = new SplittingRule();
+        rules.setDefaultStride(stride);
+        try {
+            var splitRules = splitRule.split(";");
+            for (int i = 0; i < splitRules.length; i++) {
+                StringTokenizer tk = new StringTokenizer(splitRules[i], ":(), ");
+                String ruleName = tk.hasMoreTokens() ? tk.nextToken() : ""; // INDEX:
+                String tableName = tk.hasMoreTokens() ? tk.nextToken() : "*"; // TABLENAME(
+
+                if (ruleName.equalsIgnoreCase("INDEX")) {
+                    String colOrIdx = tk.hasMoreTokens() ? tk.nextToken() : "ROWNO"; // rowno
+                    if (tk.hasMoreTokens()) {
+                        stride = Integer.parseInt(tk.nextToken()); // ,1000
+                    }
+                    rules.newRule(tableName, SplittingRule.RuleType.INDEX)
+                            .withColOrIdx(colOrIdx)
+                            .withStride(stride);
+                    //rangeInfos = getRangeInfosIntegerIndex(tableRelationHandle, connection, stride, colOrIdx);
+                }
+                else if (ruleName.equalsIgnoreCase("ROWID")) {
+                    int partcnt = !tk.hasMoreTokens()
+                            ? 100 :
+                            Integer.valueOf(tk.nextToken());
+                    rules.newRule(tableName, SplittingRule.RuleType.ROWID).withPartitions(partcnt);
+                    //rangeInfos = getRangeInfosRowid(tableRelationHandle, connection, partcnt);
+                }
+                else if (ruleName.equalsIgnoreCase("NTILE")) { // NTILE:*(ROWNO,100)
+                    String colOrIdx = tk.hasMoreTokens() ? tk.nextToken() : "ROWNO"; // rowno
+                    int parts = 100;
+                    if (tk.hasMoreTokens()) {
+                        parts = Integer.parseInt(tk.nextToken()); // ,1000
+                    }
+                    rules.newRule(tableName, SplittingRule.RuleType.NTILE)
+                            .withPartitions(parts);
+                    //rangeInfos = getRangeInfosNtileIndex(tableRelationHandle, connection, parts, colOrIdx);
+                }
+            }
+        }
+        catch (Exception x) {
+            Logger log0 = Logger.get(OracleClient.class);
+            log0.error(" Unable to parse rule : " + splitRule);
+        }
+        return rules;
+    }
+
+    private static Optional<List<RangeInfo>> getRangeInfosIntegerIndex(JdbcNamedRelationHandle tableRelationHandle,
+            Connection connection, int stride, String colOrIdx)
+    {
+        Map<String, List<String>> masterIndex = new HashMap<>();
+        Logger log = Logger.get(OracleClient.class);
         log.info("getting split range => " + tableRelationHandle.toString());
         String sql = "select index_name, table_owner, column_name, column_position from all_ind_columns where table_owner=? and table_name=?";
-        Connection connection = null;
+        Optional<List<RangeInfo>> result = Optional.empty();
         try {
-            connection = getConnection(session, null, tableHandle);
             PreparedStatement preparedStatement = connection.prepareStatement(sql);
-            preparedStatement.setString(1, tableRelationHandle.getSchemaTableName().getSchemaName());
-            preparedStatement.setString(2, tableRelationHandle.getSchemaTableName().getTableName());
+            var schemaName = tableRelationHandle.getSchemaTableName().getSchemaName().toUpperCase(ENGLISH);
+            var tableName = tableRelationHandle.getSchemaTableName().getTableName().toUpperCase(ENGLISH);
+            log.info("sql => " + sql + " -- schemaName " + schemaName + " tableName " + tableName);
+            preparedStatement.setString(1, schemaName);
+            preparedStatement.setString(2, tableName);
             ResultSet rs = preparedStatement.executeQuery();
             while (rs.next()) {
                 String indexName = rs.getString(1);
@@ -1005,15 +1196,8 @@ public class OracleClient
             for (Map.Entry<String, List<String>> entry : masterIndex.entrySet()) {
                 if (entry.getValue().size() == 1) {
                     String theColumn = entry.getValue().get(0);
-                    if (theColumn.equalsIgnoreCase("ROWNO")) {
+                    if (theColumn.contains(colOrIdx) || entry.getKey().contains(colOrIdx)) {
                         columnPart = theColumn;
-                    }
-                }
-            }
-            if (columnPart == null) {
-                for (Map.Entry<String, List<String>> entry : masterIndex.entrySet()) {
-                    if (entry.getValue().size() == 1) {
-                        columnPart = entry.getValue().get(0);
                     }
                 }
             }
@@ -1021,44 +1205,169 @@ public class OracleClient
                 return result;
             }
             rs.close();
+            log.info("getSplitRange: split on column " + columnPart);
             preparedStatement.close();
             String sql2 = "SELECT MIN(" + columnPart
                     + ") MINV, MAX(" + columnPart + ") MAXV FROM " + tableRelationHandle.getSchemaTableName().getSchemaName()
-                     + "." + tableRelationHandle.getSchemaTableName().getTableName();
+                    + "." + tableRelationHandle.getSchemaTableName().getTableName();
             preparedStatement = connection.prepareStatement(sql2);
             ResultSet rs2 = preparedStatement.executeQuery();
+            log.info("getSplitRange: executed " + sql2);
             while (rs2.next()) {
                 Object ob1 = rs2.getObject(1);
                 if (ob1 == null) {
-                    return result;
+                    return Optional.empty();
                 }
                 ob1 = rs2.getObject(2);
                 if (ob1 == null) {
-                    return result;
+                    return Optional.empty();
                 }
                 int minVal = rs2.getInt(1);
                 int maxVal = rs2.getInt(2);
                 int curPos = minVal;
-                int stride = OracleSessionProperties.getSplitStride(session);
+
+                log.info("getSplitRange: minVal " + minVal + "maxVal " + maxVal);
                 List<RangeInfo> result1 = new ArrayList<>();
                 Optional<Integer> lowerBound = Optional.empty();
                 Optional<Integer> upperBound = Optional.of(curPos + stride);
                 result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
                 curPos += stride;
-                while (curPos < maxVal) {
+                while (curPos <= maxVal) {
                     lowerBound = upperBound;
                     upperBound = Optional.of(curPos + stride);
                     result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
+                    curPos += stride;
+                }
+                for (RangeInfo r : result1) {
+                    log.info("getSplitRanges : " + r.toString());
                 }
                 result = Optional.of(result1);
             }
             rs2.close();
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+        return result;
+    }
+
+    private static Optional<List<RangeInfo>> getRangeInfosNtileIndex(JdbcNamedRelationHandle tableRelationHandle,
+            Connection connection, int parts, String colOrIdx)
+    {
+        Map<String, List<String>> masterIndex = new HashMap<>();
+        Logger log = Logger.get(OracleClient.class);
+        log.info("getting split range => " + tableRelationHandle.toString());
+        String sql = "select index_name, table_owner, column_name, column_position from all_ind_columns where table_owner=? and table_name=?";
+        Optional<List<RangeInfo>> result = Optional.empty();
+        try {
+            PreparedStatement preparedStatement = connection.prepareStatement(sql);
+            var schemaName = tableRelationHandle.getSchemaTableName().getSchemaName().toUpperCase(ENGLISH);
+            var tableName = tableRelationHandle.getSchemaTableName().getTableName().toUpperCase(ENGLISH);
+            log.info("sql => " + sql + " -- schemaName " + schemaName + " tableName " + tableName);
+            preparedStatement.setString(1, schemaName);
+            preparedStatement.setString(2, tableName);
+            ResultSet rs = preparedStatement.executeQuery();
+            while (rs.next()) {
+                String indexName = rs.getString(1);
+                if (!masterIndex.containsKey(indexName)) {
+                    masterIndex.put(indexName, new ArrayList<>());
+                }
+                masterIndex.get(indexName).add(rs.getString(3));
+            }
+            String columnPart = null;
+            for (Map.Entry<String, List<String>> entry : masterIndex.entrySet()) {
+                if (entry.getValue().size() == 1) {
+                    String theColumn = entry.getValue().get(0);
+                    if (theColumn.contains(colOrIdx) || entry.getKey().contains(colOrIdx)) {
+                        columnPart = theColumn;
+                    }
+                }
+            }
+            if (columnPart == null) {
+                return Optional.empty();
+            }
+            rs.close();
+            log.info("getSplitRange: split on column " + columnPart);
+            preparedStatement.close();
+            //select min (vkont) minvkont, max(vkont) maxvkont, bucketno from (select vkont,ntile(100) over (order by vkont) bucketno from sapsr3.fkkvkp) a group by bucketno;
+            String sql2 = "SELECT MIN(" + columnPart
+                    + ") MINV, MAX(" + columnPart + ") MAXV, BUCKETNO FROM (SELECT "
+                    + columnPart + ", NTILE(" + parts + ") over (ORDER BY " + columnPart
+                    + ") BUCKETNO FROM " + tableRelationHandle.getSchemaTableName().getSchemaName()
+                    + "." + tableRelationHandle.getSchemaTableName().getTableName()
+                    + ") A GROUP BY BUCKETNO";
+            preparedStatement = connection.prepareStatement(sql2);
+            ResultSet rs2 = preparedStatement.executeQuery();
+            log.info("getSplitRange: executed " + sql2);
+            List<RangeInfo> result1 = new ArrayList<>();
+            while (rs2.next()) {
+                Object ob1 = rs2.getObject(1);
+                if (ob1 == null) {
+                    return Optional.empty();
+                }
+                Object ob2 = rs2.getObject(2);
+                if (ob2 == null) {
+                    return Optional.empty();
+                }
+                log.info("getSplitRange: minVal " + ob1 + "maxVal " + ob2);
+                result1.add(new RangeInfo(columnPart, Optional.of(ob1), Optional.of(ob2)));
+            }
+            rs2.close();
+            if (!result1.isEmpty()) {
+                result1.get(result1.size() - 1).setUpperInclusive(true);
+            }
+            result = Optional.of(result1);
             return result;
         }
         catch (SQLException e) {
             throw new TrinoException(JDBC_ERROR, e);
         }
-        finally {
+    }
+
+    private static Optional<List<RangeInfo>> getRangeInfosRowid(JdbcNamedRelationHandle tableRelationHandle,
+            Connection connection, int fragments)
+    {
+        Map<String, List<String>> masterIndex = new HashMap<>();
+        Logger log = Logger.get(OracleClient.class);
+        log.info("getting split range => " + tableRelationHandle.toString());
+        String sql = "select min(rowid1) minrowid, max(rowid1) maxrowid, bucketno from ( select rowid rowid1, ntile("
+                + fragments + ") over (order by rowid) bucketno from " + tableRelationHandle.getSchemaTableName().getSchemaName()
+                + "." + tableRelationHandle.getSchemaTableName().getTableName() + ") a group by bucketno";
+        Optional<List<RangeInfo>> result = Optional.empty();
+        try {
+            PreparedStatement preparedStatement = connection.prepareStatement(sql);
+            log.info("sql => " + sql);
+            ResultSet rs = preparedStatement.executeQuery();
+            List<RangeInfo> result1 = new ArrayList<>();
+            while (rs.next()) {
+                String minVal = rs.getString(1);
+                String maxVal = rs.getString(2);
+                int bucketNo = rs.getInt(3);
+                log.info("getSplitRange: bucket " + bucketNo + " minVal " + minVal + "maxVal " + maxVal);
+                result1.add(new RangeInfo("ROWID", Optional.of(minVal), Optional.of(maxVal)));
+            }
+            if (!result1.isEmpty()) {
+                int last = result1.size() - 1;
+                result1.get(last).setUpperInclusive(true);
+            }
+            result = Optional.of(result1);
+            rs.close();
+            log.info("getSplitRange: split on ROWID");
+
+            return result;
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+    }
+
+    private Connection getConnectionForTableHandle(ConnectorSession session, JdbcTableHandle tableHandle, Connection connection, Logger log)
+    {
+        try {
+            connection = getConnection(session, null, tableHandle);
+        }
+        catch (SQLException se) {
+            log.error(se);
             if (connection != null) {
                 try {
                     connection.close();
@@ -1067,25 +1376,117 @@ public class OracleClient
                 }
             }
         }
+        return connection;
+    }
+
+    @Override
+    public PreparedQuery prepareQuery(ConnectorSession session, JdbcTableHandle table, Optional<List<List<JdbcColumnHandle>>> groupingSets, List<JdbcColumnHandle> columns, Map<String, ParameterizedExpression> columnExpressions)
+    {
+        var preparedQuery = super.prepareQuery(session, table, groupingSets, columns, columnExpressions);
+        if (table.isNamedRelation()) {
+            var namedRelation = table.getRequiredNamedRelation();
+            queryToInfo.put(preparedQuery, new QueryEnhancedInfo(namedRelation));
+        }
+        return preparedQuery;
+    }
+
+    WeakHashMap<PreparedQuery, QueryEnhancedInfo> queryToInfo = new WeakHashMap<>();
+
+    @Override
+    public Optional<PreparedQuery> implementJoin(ConnectorSession session, JoinType joinType, PreparedQuery leftSource, Map<JdbcColumnHandle, String> leftProjections, PreparedQuery rightSource, Map<JdbcColumnHandle, String> rightProjections, List<ParameterizedExpression> joinConditions, JoinStatistics statistics)
+    {
+        QueryEnhancedInfo leftInfo = null;
+        QueryEnhancedInfo rightInfo = null;
+        if (queryToInfo.containsKey(leftSource)) {
+            leftInfo = queryToInfo.get(leftSource);
+        }
+        if (queryToInfo.containsKey(rightSource)) {
+            rightInfo = queryToInfo.get(rightSource);
+        }
+        QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, leftProjections, rightProjections);
+
+        Logger log = Logger.get(OracleClient.class);
+        var leftParams = leftSource.getParameters()
+                .stream().map(Object::toString).collect(Collectors.joining(","));
+        var rightParams = rightSource.getParameters()
+                .stream().map(Object::toString).collect(Collectors.joining(","));
+        log.info("implementJoin: left -> " + leftSource.getQuery() + " params " + leftParams);
+        log.info("implementJoin: right -> " + rightSource.getQuery() + " params " + rightParams);
+        Optional<PreparedQuery> result = super.implementJoin(session, joinType, leftSource, leftProjections, rightSource, rightProjections, joinConditions, statistics);
+        if (result.isPresent() && !(result.isEmpty())) {
+            var resultParam = result.get().getParameters()
+                    .stream().map(Object::toString).collect(Collectors.joining(","));
+            log.info("implementJoin result: " + result.get().getQuery() + " params " + resultParam);
+        }
+        if (result.isPresent()) {
+            queryToInfo.put(result.get(), newInfo);
+        }
+        return result;
+    }
+
+    @Override
+    public Optional<PreparedQuery> legacyImplementJoin(ConnectorSession session, JoinType joinType, PreparedQuery leftSource, PreparedQuery rightSource, List<JdbcJoinCondition> joinConditions, Map<JdbcColumnHandle, String> rightAssignments, Map<JdbcColumnHandle, String> leftAssignments, JoinStatistics statistics)
+    {
+        QueryEnhancedInfo leftInfo = null;
+        QueryEnhancedInfo rightInfo = null;
+        if (queryToInfo.containsKey(leftSource)) {
+            leftInfo = queryToInfo.get(leftSource);
+        }
+        if (queryToInfo.containsKey(rightSource)) {
+            rightInfo = queryToInfo.get(rightSource);
+        }
+        QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, rightAssignments, leftAssignments);
+        Logger log = Logger.get(OracleClient.class);
+        var leftParams = leftSource.getParameters()
+                .stream().map(Object::toString).collect(Collectors.joining(","));
+        var rightParams = rightSource.getParameters()
+                .stream().map(Object::toString).collect(Collectors.joining(","));
+        log.info("legacyImplementJoin: left -> " + leftSource.getQuery() + " params " + leftParams);
+        log.info("legacyImplementJoin: right -> " + rightSource.toString() + " params " + rightParams);
+        Optional<PreparedQuery> result = super.legacyImplementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics);
+        if (result.isPresent() && !(result.isEmpty())) {
+            var resultParam = result.get().getParameters()
+                    .stream().map(Object::toString).collect(Collectors.joining(","));
+            log.info("legacyImplementJoin result: " + result.get().getQuery() + " params " + resultParam);
+        }
+        if (result.isPresent()) {
+            queryToInfo.put(result.get(), newInfo);
+        }
+        return result;
     }
 
     public static class RangeInfo
     {
+        private final boolean isInteger;
         private final String expression;
         /**
          * The lower bound of the range (included)
          */
-        private final Optional<Integer> lowerBound;
+        private final Optional lowerBound;
         /**
          * The upper bound of the range (not include the upperBond itself)
          */
-        private final Optional<Integer> upperBound;
+        private final Optional upperBound;
 
-        public RangeInfo(String expression, Optional<Integer> lowerBound, Optional<Integer> upperBound)
+        boolean upperInclusive;
+
+        public RangeInfo(String expression, Optional lowerBound, Optional upperBound)
         {
             this.expression = requireNonNull(expression, "expression is null");
             this.lowerBound = requireNonNull(lowerBound, "lowerBound is null");
             this.upperBound = requireNonNull(upperBound, "upperBound is null");
+            if (((!lowerBound.isEmpty()) && (lowerBound.get() instanceof Integer))
+                    || ((!upperBound.isEmpty()) && (upperBound.get() instanceof Integer))) {
+                this.isInteger = true;
+            }
+            else {
+                this.isInteger = false;
+            }
+        }
+
+        public void setUpperInclusive(boolean b)
+        {
+            this.upperInclusive = b;
         }
 
         public String getExpression()
@@ -1131,6 +1532,16 @@ public class OracleClient
         public String toString()
         {
             return "[" + lowerBound + ", " + upperBound + ")";
+        }
+
+        public boolean isUpperInclusive()
+        {
+            return this.upperInclusive;
+        }
+
+        public boolean isInteger()
+        {
+            return this.isInteger;
         }
     }
 }

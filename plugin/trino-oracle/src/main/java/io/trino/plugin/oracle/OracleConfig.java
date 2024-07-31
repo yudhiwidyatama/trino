@@ -41,6 +41,7 @@ public class OracleConfig
     private Integer fetchSize;
     private int splitStride = 1000;
     private boolean experimentalSplit = true;
+    private String splitRule = "";
 
     public boolean isSynonymsEnabled()
     {
@@ -62,6 +63,18 @@ public class OracleConfig
     {
         this.splitStride = num;
         return this;
+    }
+
+    @Config("oracle.split_rule")
+    public OracleConfig setSplitRule(String s)
+    {
+        this.splitRule = s;
+        return this;
+    }
+
+    public String getSplitRule()
+    {
+        return splitRule;
     }
 
     @Config("oracle.experimental.split")
