@@ -426,7 +426,12 @@ public class OracleClient
                             + indexSpec);
                 }
                 String indexColumns = indexSpec.substring(pos1 + 1, pos2);
-                String indexName = indexSpec.substring(0, pos1);
+                String tableName = remoteTableName.getTableName();
+                if (tableName.length() >= 5) {
+                    tableName = tableName.substring(tableName.length() - 5);
+                }
+
+                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1);
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
                                 quoted(indexName),
@@ -1157,7 +1162,8 @@ public class OracleClient
                         parts = Integer.parseInt(tk.nextToken()); // ,1000
                     }
                     rules.newRule(tableName, SplittingRule.RuleType.NTILE)
-                            .withPartitions(parts);
+                            .withPartitions(parts)
+                            .withColOrIdx(colOrIdx);
                     //rangeInfos = getRangeInfosNtileIndex(tableRelationHandle, connection, parts, colOrIdx);
                 }
             }

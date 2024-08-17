@@ -62,6 +62,7 @@ public class OracleClientModule
         newSetBinder(binder, ConnectorTableFunction.class).addBinding().toProvider(Query.class).in(Scopes.SINGLETON);
         newSetBinder(binder, RetryStrategy.class).addBinding().to(OracleRetryStrategy.class).in(Scopes.SINGLETON);
         bindProcedure(binder, GatherStatsProvider.class);
+        bindProcedure(binder, GrantProvider.class);
 //        binder.bind(ConnectorMetadata.class).annotatedWith(ForClassLoaderSafe.class).to(EnhancedMetadata.class).in(Scopes.SINGLETON);
 //        newOptionalBinder(binder, QueryBuilder.class).setBinding().to(EnhancedQueryBuilder.class).in(Scopes.SINGLETON);
     }
