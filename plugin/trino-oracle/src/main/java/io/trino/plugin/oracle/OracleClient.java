@@ -1412,17 +1412,17 @@ public class OracleClient
         QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, leftProjections, rightProjections);
 
         Logger log = Logger.get(OracleClient.class);
-        var leftParams = leftSource.getParameters()
+        var leftParams = leftSource.parameters()
                 .stream().map(Object::toString).collect(Collectors.joining(","));
-        var rightParams = rightSource.getParameters()
+        var rightParams = rightSource.parameters()
                 .stream().map(Object::toString).collect(Collectors.joining(","));
-        log.info("implementJoin: left -> " + leftSource.getQuery() + " params " + leftParams);
-        log.info("implementJoin: right -> " + rightSource.getQuery() + " params " + rightParams);
+        log.info("implementJoin: left -> " + leftSource.query() + " params " + leftParams);
+        log.info("implementJoin: right -> " + rightSource.query() + " params " + rightParams);
         Optional<PreparedQuery> result = super.implementJoin(session, joinType, leftSource, leftProjections, rightSource, rightProjections, joinConditions, statistics);
         if (result.isPresent() && !(result.isEmpty())) {
-            var resultParam = result.get().getParameters()
+            var resultParam = result.get().parameters()
                     .stream().map(Object::toString).collect(Collectors.joining(","));
-            log.info("implementJoin result: " + result.get().getQuery() + " params " + resultParam);
+            log.info("implementJoin result: " + result.get().query() + " params " + resultParam);
         }
         if (result.isPresent()) {
             queryToInfo.put(result.get(), newInfo);
@@ -1443,17 +1443,17 @@ public class OracleClient
         }
         QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, rightAssignments, leftAssignments);
         Logger log = Logger.get(OracleClient.class);
-        var leftParams = leftSource.getParameters()
+        var leftParams = leftSource.parameters()
                 .stream().map(Object::toString).collect(Collectors.joining(","));
-        var rightParams = rightSource.getParameters()
+        var rightParams = rightSource.parameters()
                 .stream().map(Object::toString).collect(Collectors.joining(","));
-        log.info("legacyImplementJoin: left -> " + leftSource.getQuery() + " params " + leftParams);
+        log.info("legacyImplementJoin: left -> " + leftSource.query() + " params " + leftParams);
         log.info("legacyImplementJoin: right -> " + rightSource.toString() + " params " + rightParams);
         Optional<PreparedQuery> result = super.legacyImplementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics);
         if (result.isPresent() && !(result.isEmpty())) {
-            var resultParam = result.get().getParameters()
+            var resultParam = result.get().parameters()
                     .stream().map(Object::toString).collect(Collectors.joining(","));
-            log.info("legacyImplementJoin result: " + result.get().getQuery() + " params " + resultParam);
+            log.info("legacyImplementJoin result: " + result.get().query() + " params " + resultParam);
         }
         if (result.isPresent()) {
             queryToInfo.put(result.get(), newInfo);
