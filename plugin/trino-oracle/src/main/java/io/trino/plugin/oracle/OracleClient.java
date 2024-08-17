@@ -1122,6 +1122,8 @@ public class OracleClient
                     return getRangeInfosIntegerIndex(tableRelationHandle, connection, r.stride, r.colOrIdx);
                 case SplittingRule.RuleType.NTILE:
                     return getRangeInfosNtileIndex(tableRelationHandle, connection, r.partitions, r.colOrIdx);
+                default:
+                    return Optional.empty();
             }
         }
         return Optional.empty();
@@ -1333,7 +1335,6 @@ public class OracleClient
     private static Optional<List<RangeInfo>> getRangeInfosRowid(JdbcNamedRelationHandle tableRelationHandle,
             Connection connection, int fragments)
     {
-        Map<String, List<String>> masterIndex = new HashMap<>();
         Logger log = Logger.get(OracleClient.class);
         log.info("getting split range => " + tableRelationHandle.toString());
         String sql = "select min(rowid1) minrowid, max(rowid1) maxrowid, bucketno from ( select rowid rowid1, ntile("
@@ -1419,7 +1420,7 @@ public class OracleClient
         log.info("implementJoin: left -> " + leftSource.query() + " params " + leftParams);
         log.info("implementJoin: right -> " + rightSource.query() + " params " + rightParams);
         Optional<PreparedQuery> result = super.implementJoin(session, joinType, leftSource, leftProjections, rightSource, rightProjections, joinConditions, statistics);
-        if (result.isPresent() && !(result.isEmpty())) {
+        if (result.isPresent() && !result.isEmpty()) {
             var resultParam = result.get().parameters()
                     .stream().map(Object::toString).collect(Collectors.joining(","));
             log.info("implementJoin result: " + result.get().query() + " params " + resultParam);
@@ -1450,7 +1451,7 @@ public class OracleClient
         log.info("legacyImplementJoin: left -> " + leftSource.query() + " params " + leftParams);
         log.info("legacyImplementJoin: right -> " + rightSource.toString() + " params " + rightParams);
         Optional<PreparedQuery> result = super.legacyImplementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics);
-        if (result.isPresent() && !(result.isEmpty())) {
+        if (result.isPresent()) {
             var resultParam = result.get().parameters()
                     .stream().map(Object::toString).collect(Collectors.joining(","));
             log.info("legacyImplementJoin result: " + result.get().query() + " params " + resultParam);
@@ -1481,8 +1482,8 @@ public class OracleClient
             this.expression = requireNonNull(expression, "expression is null");
             this.lowerBound = requireNonNull(lowerBound, "lowerBound is null");
             this.upperBound = requireNonNull(upperBound, "upperBound is null");
-            if (((!lowerBound.isEmpty()) && (lowerBound.get() instanceof Integer))
-                    || ((!upperBound.isEmpty()) && (upperBound.get() instanceof Integer))) {
+            if ((lowerBound.isPresent() && (lowerBound.get() instanceof Integer))
+                    || (upperBound.isPresent() && (upperBound.get() instanceof Integer))) {
                 this.isInteger = true;
             }
             else {
@@ -1500,12 +1501,12 @@ public class OracleClient
             return expression;
         }
 
-        public Optional<Integer> getLowerBound()
+        public Optional getLowerBound()
         {
             return lowerBound;
         }
 
-        public Optional<Integer> getUpperBound()
+        public Optional getUpperBound()
         {
             return upperBound;
         }
