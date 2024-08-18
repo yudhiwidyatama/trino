@@ -21,11 +21,6 @@ public class SplittingRule
     List<Rule> rules = new ArrayList<>();
     int stride;
 
-    public void setDefaultStride(int stride)
-    {
-        this.stride = stride;
-    }
-
     public enum RuleType {
         ROWID,
         INDEX,

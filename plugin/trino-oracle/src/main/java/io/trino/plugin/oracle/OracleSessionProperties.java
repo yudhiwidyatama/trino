@@ -55,11 +55,6 @@ public final class OracleSessionProperties
                         "experimental_split",
                         "Experimental split",
                         config.getExperimentalSplit(), false))
-                .add(integerProperty(
-                        "split_stride",
-                        "Default scale for Oracle Number data type",
-                        config.getSplitStride(),
-                        false))
                 .add(stringProperty(
                         "split_rule",
                         "Splitting rule",

@@ -1072,8 +1072,7 @@ public class OracleClient
         log0.info("getSplitRanges: for " + tableHandle.toString());
         Connection connection = null;
         String splitRule = OracleSessionProperties.getSplitRule(session);
-        int stride = OracleSessionProperties.getSplitStride(session);
-        var rules = parseRules(splitRule, stride);
+        var rules = parseRules(splitRule);
         connection = getConnectionForTableHandle(session, tableHandle, connection, log0);
         if (connection == null) {
             log0.info(" unable to get connection in getSplitRanges ");
@@ -1100,7 +1099,7 @@ public class OracleClient
             connection.close();
         }
         catch (Exception ex) {
-            // ignore exception
+            throw new RuntimeException("getSplitRange failed", ex);
         }
         return rangeInfos;
     }
@@ -1129,10 +1128,9 @@ public class OracleClient
         return Optional.empty();
     }
 
-    private static SplittingRule parseRules(String splitRule, int stride)
+    private static SplittingRule parseRules(String splitRule)
     {
         var rules = new SplittingRule();
-        rules.setDefaultStride(stride);
         try {
             var splitRules = splitRule.split(";");
             for (int i = 0; i < splitRules.length; i++) {
@@ -1142,6 +1140,7 @@ public class OracleClient
 
                 if (ruleName.equalsIgnoreCase("INDEX")) {
                     String colOrIdx = tk.hasMoreTokens() ? tk.nextToken() : "ROWNO"; // rowno
+                    int stride = 50000;
                     if (tk.hasMoreTokens()) {
                         stride = Integer.parseInt(tk.nextToken()); // ,1000
                     }
