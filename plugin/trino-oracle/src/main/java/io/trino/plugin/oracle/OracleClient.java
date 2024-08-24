@@ -1233,10 +1233,10 @@ public class OracleClient
                 result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
                 curPos += stride;
                 while (curPos <= maxVal) {
-                    lowerBound = upperBound;
-                    upperBound = Optional.of(curPos + stride);
-                    result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
+                    lowerBound = upperBound; // = curPos
                     curPos += stride;
+                    upperBound = Optional.of(curPos);
+                    result1.add(new RangeInfo(columnPart, lowerBound, upperBound));
                 }
                 for (RangeInfo r : result1) {
                     log.info("getSplitRanges : " + r.toString());
@@ -1310,12 +1310,10 @@ public class OracleClient
                     return Optional.empty();
                 }
                 log.info("getSplitRange: minVal " + ob1 + "maxVal " + ob2);
-                result1.add(new RangeInfo(columnPart, Optional.of(ob1), Optional.of(ob2)));
+                result1.add(new RangeInfo(columnPart, Optional.of(ob1), Optional.of(ob2))
+                        .withUpperInclusive(true));
             }
             rs2.close();
-            if (!result1.isEmpty()) {
-                result1.get(result1.size() - 1).setUpperInclusive(true);
-            }
             result = Optional.of(result1);
             return result;
         }
@@ -1344,11 +1342,8 @@ public class OracleClient
                 String maxVal = rs.getString(2);
                 int bucketNo = rs.getInt(3);
                 log.info("getSplitRange: bucket " + bucketNo + " minVal " + minVal + "maxVal " + maxVal);
-                result1.add(new RangeInfo("ROWID", Optional.of(minVal), Optional.of(maxVal)));
-            }
-            if (!result1.isEmpty()) {
-                int last = result1.size() - 1;
-                result1.get(last).setUpperInclusive(true);
+                result1.add(new RangeInfo("ROWID", Optional.of(minVal), Optional.of(maxVal))
+                        .withUpperInclusive(true));
             }
             result = Optional.of(result1);
             rs.close();
@@ -1487,6 +1482,12 @@ public class OracleClient
         public void setUpperInclusive(boolean b)
         {
             this.upperInclusive = b;
+        }
+
+        public RangeInfo withUpperInclusive(boolean b)
+        {
+            this.upperInclusive = b;
+            return this;
         }
 
         public String getExpression()
