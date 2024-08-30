@@ -36,7 +36,7 @@ public class OracleConfig
     private RoundingMode numberRoundingMode = RoundingMode.UNNECESSARY;
     private boolean connectionPoolEnabled = true;
     private int connectionPoolMinSize = 1;
-    private int connectionPoolMaxSize = 30;
+    private int connectionPoolMaxSize = 50;
     private Duration inactiveConnectionTimeout = new Duration(20, MINUTES);
     private Integer fetchSize;
     private boolean experimentalSplit = true;
