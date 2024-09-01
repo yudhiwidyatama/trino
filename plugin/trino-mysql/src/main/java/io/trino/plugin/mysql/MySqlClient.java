@@ -34,7 +34,11 @@ import io.trino.plugin.jdbc.ConnectionFactory;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcExpression;
 import io.trino.plugin.jdbc.JdbcJoinCondition;
+import io.trino.plugin.jdbc.JdbcNamedRelationHandle;
+import io.trino.plugin.jdbc.JdbcQueryRelationHandle;
+import io.trino.plugin.jdbc.JdbcRelationHandle;
 import io.trino.plugin.jdbc.JdbcSortItem;
+import io.trino.plugin.jdbc.JdbcSplit;
 import io.trino.plugin.jdbc.JdbcStatisticsConfig;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
@@ -67,7 +71,9 @@ import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.connector.JoinStatistics;
 import io.trino.spi.connector.JoinType;
@@ -113,7 +119,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.WeakHashMap;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
@@ -233,6 +241,7 @@ public class MySqlClient
     private final boolean statisticsEnabled;
     private final ConnectorExpressionRewriter<ParameterizedExpression> connectorExpressionRewriter;
     private final AggregateFunctionRewriter<JdbcExpression, ?> aggregateFunctionRewriter;
+    WeakHashMap<PreparedQuery, QueryEnhancedInfo> queryToInfo = new WeakHashMap<>();
 
     private static final PredicatePushdownController MYSQL_CHARACTER_PUSHDOWN = (session, domain) -> {
         if (domain.isNullableSingleValue()) {
@@ -978,6 +987,116 @@ public class MySqlClient
     }
 
     @Override
+    public PreparedQuery prepareQuery(ConnectorSession session, JdbcTableHandle table, Optional<List<List<JdbcColumnHandle>>> groupingSets, List<JdbcColumnHandle> columns, Map<String, ParameterizedExpression> columnExpressions)
+    {
+        var preparedQuery = super.prepareQuery(session, table, groupingSets, columns, columnExpressions);
+        if (table.isNamedRelation()) {
+            var namedRelation = table.getRequiredNamedRelation();
+            queryToInfo.put(preparedQuery, new QueryEnhancedInfo(namedRelation));
+        }
+        return preparedQuery;
+    }
+
+    private Optional<List<RangeInfo>> getSplitRangesFromQueryInfo(Connection connection, QueryEnhancedInfo queryInfo, SplittingRule rule)
+    {
+        Logger log = Logger.get(MySqlClient.class);
+        if (queryInfo == null) {
+            return Optional.empty();
+        }
+        if (queryInfo.isNamedRelation) {
+            return RangeInfo.getRangeInfos(queryInfo.namedRelation, connection, rule);
+        }
+        else {
+            if (queryInfo.isJoin) {
+                Optional<List<RangeInfo>> rightRange = getSplitRangesFromQueryInfo(connection, queryInfo.rightInfo, rule);
+                // heuristic : choose non-blank range
+                //if (leftRange.isEmpty()) {
+                //    return adjustRange(rightRange, queryInfo.rightProjections);
+                //}
+                if (rightRange.isEmpty()) {
+                    Optional<List<RangeInfo>> leftRange = getSplitRangesFromQueryInfo(connection, queryInfo.leftInfo, rule);
+                    return RangeInfo.adjustRange(leftRange, queryInfo.leftProjections);
+                }
+                return RangeInfo.adjustRange(rightRange, queryInfo.rightProjections);
+                // heuristic : choose build-side (right-side) partitioning
+            }
+            else {
+                log.info("unknown query info, should be <<FATAL>> ");
+                return Optional.empty();
+            }
+        }
+    }
+
+    public Optional<List<RangeInfo>> getSplitRanges(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        Logger log0 = Logger.get(MySqlClient.class);
+        Optional<List<RangeInfo>> result0 = Optional.empty();
+        log0.info("getSplitRanges: for " + tableHandle.toString());
+        //Connection connection = null;
+        String splitRule = session.getProperty("split_rule", String.class);
+        var rules = SplittingRule.parseRules(splitRule);
+        try (Connection connection = connectionFactory.openConnection(session)) {
+        //connection = // getConnectionForTableHandle(session, tableHandle, connection, log0);
+            if (connection == null) {
+                log0.info(" unable to get connection in getSplitRanges ");
+                return Optional.empty();
+            }
+
+            if (!(tableHandle.getRelationHandle() instanceof JdbcNamedRelationHandle)) {
+                JdbcRelationHandle relationHandle = tableHandle.getRelationHandle();
+                if (relationHandle instanceof JdbcQueryRelationHandle) {
+                    var queryHandle = (JdbcQueryRelationHandle) relationHandle;
+                    var preparedQuery = queryHandle.getPreparedQuery();
+                    result0 = getSplitRangesFromPrepQuery(connection, preparedQuery, tableHandle, rules);
+                }
+                else {
+                    log0.info("unknown relationHandle  => " + relationHandle.toString());
+                }
+                return result0;
+            }
+            JdbcNamedRelationHandle tableRelationHandle = tableHandle.getRequiredNamedRelation();
+
+            var rangeInfos = RangeInfo.getRangeInfos(tableRelationHandle, connection, rules);
+            return rangeInfos;
+        }
+        catch (SQLException sqle) {
+            sqle.printStackTrace();
+        }
+        return result0;
+    }
+
+    Optional<List<RangeInfo>> getSplitRangesFromPrepQuery(Connection connection, PreparedQuery query, JdbcTableHandle tableHandle, SplittingRule rule)
+    {
+        Logger log = Logger.get(MySqlClient.class);
+        if (!queryToInfo.containsKey(query)) {
+            log.info("QueryEnhancedInfo not found in cache : " + query.toString());
+            return Optional.empty();
+        }
+        var queryInfo = queryToInfo.get(query);
+        return getSplitRangesFromQueryInfo(connection, queryInfo, rule);
+    }
+
+    @Override
+    public ConnectorSplitSource getSplits(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        if (!MySqlSessionProperties.getExperimentalSplit(session)) {
+            return super.getSplits(session, tableHandle);
+        }
+        Optional<List<RangeInfo>> splitRanges = getSplitRanges(session, tableHandle);
+        if (!splitRanges.isPresent()) {
+            return super.getSplits(session, tableHandle);
+        }
+        List<RangeInfo> splitRange1 = splitRanges.get();
+        if (splitRange1.isEmpty()) {
+            return super.getSplits(session, tableHandle);
+        }
+        List<JdbcSplit> splits = splitRange1.stream()
+                .map(RangeInfo::convertRangeInfoIntoPredicate)
+                .map(x -> new JdbcSplit(Optional.of(x)))
+                .collect(Collectors.toList());
+        return new FixedSplitSource(splits);
+    }
+    @Override
     protected Optional<TopNFunction> topNFunction()
     {
         return Optional.of((query, sortItems, limit) -> {
@@ -1030,13 +1149,26 @@ public class MySqlClient
             // Not supported in MySQL
             return Optional.empty();
         }
-        return implementJoinCostAware(
+        QueryEnhancedInfo leftInfo = null;
+        QueryEnhancedInfo rightInfo = null;
+        if (queryToInfo.containsKey(leftSource)) {
+            leftInfo = queryToInfo.get(leftSource);
+        }
+        if (queryToInfo.containsKey(rightSource)) {
+            rightInfo = queryToInfo.get(rightSource);
+        }
+        QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, leftProjections, rightProjections);
+        Optional<PreparedQuery> result = implementJoinCostAware(
                 session,
                 joinType,
                 leftSource,
                 rightSource,
                 statistics,
                 () -> super.implementJoin(session, joinType, leftSource, leftProjections, rightSource, rightProjections, joinConditions, statistics));
+        if (result.isPresent()) {
+            queryToInfo.put(result.get(), newInfo);
+        }
+        return result;
     }
 
     @Override
@@ -1054,13 +1186,26 @@ public class MySqlClient
             // Not supported in MySQL
             return Optional.empty();
         }
-        return implementJoinCostAware(
+        QueryEnhancedInfo leftInfo = null;
+        QueryEnhancedInfo rightInfo = null;
+        if (queryToInfo.containsKey(leftSource)) {
+            leftInfo = queryToInfo.get(leftSource);
+        }
+        if (queryToInfo.containsKey(rightSource)) {
+            rightInfo = queryToInfo.get(rightSource);
+        }
+        QueryEnhancedInfo newInfo = new QueryEnhancedInfo(leftInfo, rightInfo, rightAssignments, leftAssignments);
+        Optional<PreparedQuery> result = implementJoinCostAware(
                 session,
                 joinType,
                 leftSource,
                 rightSource,
                 statistics,
                 () -> super.legacyImplementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics));
+        if (result.isPresent()) {
+            queryToInfo.put(result.get(), newInfo);
+        }
+        return result;
     }
 
     @Override
@@ -1355,4 +1500,5 @@ public class MySqlClient
                     .orElse(rowCount);
         }
     }
+
 }
