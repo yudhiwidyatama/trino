@@ -25,11 +25,37 @@ public class MySqlConfig
     private boolean autoReconnect = true;
     private int maxReconnects = 3;
     private Duration connectionTimeout = new Duration(10, TimeUnit.SECONDS);
+    private boolean experimentalSplit = true;
+    private String splitRule = "";
 
     // Using `useInformationSchema=true` prevents race condition inside MySQL driver's java.sql.DatabaseMetaData.getColumns
     // implementation, which throw SQL exception when a table disappears during listing.
     // Using `useInformationSchema=false` may provide more diagnostic information (see https://github.com/trinodb/trino/issues/1597)
     private boolean driverUseInformationSchema = true;
+
+    public boolean getExperimentalSplit()
+    {
+        return experimentalSplit;
+    }
+
+    @Config("mysql.split_rule")
+    public MySqlConfig setSplitRule(String s)
+    {
+        this.splitRule = s;
+        return this;
+    }
+
+    public String getSplitRule()
+    {
+        return splitRule;
+    }
+
+    @Config("mysql.experimental.split")
+    public MySqlConfig setExperimentalSplit(boolean split)
+    {
+        this.experimentalSplit = split;
+        return this;
+    }
 
     public boolean isAutoReconnect()
     {
