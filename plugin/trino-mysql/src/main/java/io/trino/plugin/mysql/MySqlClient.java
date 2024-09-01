@@ -1096,6 +1096,7 @@ public class MySqlClient
                 .collect(Collectors.toList());
         return new FixedSplitSource(splits);
     }
+
     @Override
     protected Optional<TopNFunction> topNFunction()
     {
