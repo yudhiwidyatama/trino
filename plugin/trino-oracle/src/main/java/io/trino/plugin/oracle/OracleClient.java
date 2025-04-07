@@ -1084,6 +1084,12 @@ public class OracleClient
             else {
                 log0.info("unknown relationHandle  => " + relationHandle.toString());
             }
+            try {
+                connection.close();
+            }
+            catch (Exception ex) {
+                // ignore exception
+            }
             return result0;
         }
 
