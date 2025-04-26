@@ -431,7 +431,11 @@ public class OracleClient
                     tableName = tableName.substring(tableName.length() - 5);
                 }
 
-                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1);
+                // Generate a unique index name using timestamp
+                String timestamp = String.valueOf(System.currentTimeMillis());
+                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1) + 
+                                 "_" + timestamp.substring(timestamp.length() - 6);
+                
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
                                 quoted(indexName),
@@ -1104,7 +1108,8 @@ public class OracleClient
         return rangeInfos;
     }
 
-    private Optional<List<RangeInfo>> getRangeInfos(JdbcNamedRelationHandle tableRelationHandle, Connection connection, SplittingRule rules)
+    private Optional<List<RangeInfo>> getRangeInfos(JdbcNamedRelationHandle tableRelationHandle,
+            Connection connection, SplittingRule rules)
     {
         var thisTableName = tableRelationHandle.getSchemaTableName().getTableName();
         for (SplittingRule.Rule r : rules.rules) {
