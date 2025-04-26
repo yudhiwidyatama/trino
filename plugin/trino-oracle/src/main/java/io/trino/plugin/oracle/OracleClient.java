@@ -109,6 +109,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.StringTokenizer;
 import java.util.WeakHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
@@ -420,15 +421,38 @@ public class OracleClient
                             + indexSpec);
                 }
                 String indexColumns = indexSpec.substring(pos1 + 1, pos2);
+                String userProvidedIndexNamePart = indexSpec.substring(0, pos1);
+
+                // --- START SIMPLIFIED MODIFICATION ---
                 String tableName = remoteTableName.getTableName();
-                if (tableName.length() >= 5) {
-                    tableName = tableName.substring(tableName.length() - 5);
+                // Keep the original suffix logic (last 5 chars or less)
+                String tableNameSuffix = tableName;
+                if (tableNameSuffix.length() >= 5) {
+                    tableNameSuffix = tableNameSuffix.substring(tableNameSuffix.length() - 5);
                 }
 
-                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1);
+                // Generate a random number suffix for uniqueness
+                int randomSuffix = ThreadLocalRandom.current().nextInt(0, 10000); // 0 to 9999
+
+                // Construct the index name: I<TableSuffix>_<UserPart>_<RandomNumber>
+                // Ensure the total length respects Oracle limits (e.g., 128 bytes/chars)
+                // This format should generally be safe.
+                String indexName = format("I%s_%s_%d",
+                        tableNameSuffix.toUpperCase(ENGLISH),
+                        userProvidedIndexNamePart.toUpperCase(ENGLISH),
+                        randomSuffix);
+
+                // Optional: Add explicit length check/truncation if very long names are possible
+                // int maxOracleIdentifierLength = 128; // Be conservative if needed
+                // if (indexName.length() > maxOracleIdentifierLength) {
+                //     indexName = indexName.substring(0, maxOracleIdentifierLength);
+                //     // log.warn("Generated index name was truncated: %s", indexName);
+                // }
+                // --- END SIMPLIFIED MODIFICATION ---
+
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
-                                quoted(indexName),
+                                quoted(indexName), // Use the newly generated unique name
                                 quoted(remoteTableName),
                                 indexColumns));
             }
