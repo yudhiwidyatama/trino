@@ -426,7 +426,15 @@ public class OracleClient
                 }
 
                 // Generate a unique index name using timestamp
-                String indexName = "IDX_" + tableName + "_" + System.currentTimeMillis();
+                // Ensure total length is 30 chars max: IDX(3) + _(1) + tableName(5) + _(1) + timestamp(19) = 29 chars max
+                String timestamp = String.valueOf(System.currentTimeMillis());
+                String indexName = "IDX_" + tableName + "_" + timestamp;
+                if (indexName.length() > 30) {
+                    // If still too long, trim the timestamp while preserving uniqueness
+                    int excessLength = indexName.length() - 30;
+                    timestamp = timestamp.substring(excessLength);
+                    indexName = "IDX_" + tableName + "_" + timestamp;
+                }
                 // Create the index
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
