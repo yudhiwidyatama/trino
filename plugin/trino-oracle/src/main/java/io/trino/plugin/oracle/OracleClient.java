@@ -193,6 +193,9 @@ public class OracleClient
 
     private static final int TRINO_BIGINT_TYPE = 832_424_001;
 
+    // Using 30 for broad compatibility (older Oracle versions); 12c+ supports 128 bytes.
+    private static final int ORACLE_MAX_IDENTIFIER_LENGTH = 30;
+
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("uuuu-MM-dd");
     private static final DateTimeFormatter TIMESTAMP_SECONDS_FORMATTER = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss");
 
@@ -399,40 +402,68 @@ public class OracleClient
     @Override
     protected List<String> createTableSqls(RemoteTableName remoteTableName, List<String> columns, ConnectorTableMetadata tableMetadata)
     {
-        //checkArgument(tableMetadata.getProperties().isEmpty(), "Unsupported table properties: %s", tableMetadata.getProperties());
         java.util.Set<String> propKeys0 = tableMetadata.getProperties().keySet();
-        HashSet<String> propKeys = new HashSet<String>(propKeys0);
-        if (propKeys.contains("index")) {
+        HashSet<String> propKeys = new HashSet<>(propKeys0); // Use diamond operator
+        boolean hasIndexProperty = propKeys.contains("index"); // Check before removing
+        if (hasIndexProperty) {
             propKeys.remove("index");
         }
-        checkArgument(propKeys.isEmpty(), "Unsupported table properties: %s", propKeys.toString());
+        checkArgument(propKeys.isEmpty(), "Unsupported table properties: %s", propKeys); // Use propKeys directly
+
         ImmutableList.Builder<String> createTableSqlsBuilder = ImmutableList.builder();
         createTableSqlsBuilder.add(format("CREATE TABLE %s (%s)", quoted(remoteTableName), join(", ", columns)));
-        Optional<String> tableComment = tableMetadata.getComment();
-        if (tableMetadata.getProperties().containsKey("index")) {
-            List<String> indexspecs = (List<String>) tableMetadata.getProperties().get("index");
-            for (String indexSpec : indexspecs) {
-                int pos1 = indexSpec.indexOf("(");
-                int pos2 = indexSpec.indexOf(")");
-                if ((pos1 < 0) || (pos2 < 0)) {
-                    throw new TrinoException(JDBC_ERROR, "" +
-                            "Index spec invalid format, expected indexname(col1,col2,...) but found "
-                            + indexSpec);
-                }
-                String indexColumns = indexSpec.substring(pos1 + 1, pos2);
-                String tableName = remoteTableName.getTableName();
-                if (tableName.length() >= 5) {
-                    tableName = tableName.substring(tableName.length() - 5);
-                }
 
-                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1);
-                createTableSqlsBuilder.add(
-                        format("CREATE INDEX %s ON %s(%s)",
-                                quoted(indexName),
-                                quoted(remoteTableName),
-                                indexColumns));
+        if (hasIndexProperty) {
+            @SuppressWarnings("unchecked") // Property value type is Object, cast is necessary
+            List<String> indexSpecs = (List<String>) tableMetadata.getProperties().get("index");
+            if (indexSpecs != null) { // Add null check for safety
+                for (String indexSpec : indexSpecs) {
+                    int pos1 = indexSpec.indexOf('('); // Use char literal
+                    int pos2 = indexSpec.lastIndexOf(')'); // Use lastIndexOf for robustness
+                    // Validate format: name must exist, columns must exist, '(' must be before ')', ')' must be last char
+                    if ((pos1 <= 0) || (pos2 <= pos1 + 1) || (pos2 != indexSpec.length() - 1)) {
+                        throw new TrinoException(JDBC_ERROR,
+                                "Index spec invalid format, expected indexname(col1,col2,...) but found " + indexSpec);
+                    }
+                    String indexSpecName = indexSpec.substring(0, pos1).trim(); // Get the name part, trim whitespace
+                    String indexColumns = indexSpec.substring(pos1 + 1, pos2).trim(); // Get the column part, trim whitespace
+
+                    if (indexSpecName.isEmpty() || indexColumns.isEmpty()) {
+                        throw new TrinoException(JDBC_ERROR,
+                                "Index spec invalid format, index name and columns cannot be empty in " + indexSpec);
+                    }
+
+                    String fullTableName = remoteTableName.getTableName();
+
+                    // Construct a potentially long index name: I_<TABLE_NAME>_<INDEX_SPEC_NAME>
+                    // Using uppercase for consistency, although quoting handles case sensitivity.
+                    String proposedIndexName = ("I_" + fullTableName + "_" + indexSpecName).toUpperCase(ENGLISH);
+
+                    // Truncate if exceeds Oracle's limit (using 30 for safety)
+                    String finalIndexName;
+                    if (proposedIndexName.length() > ORACLE_MAX_IDENTIFIER_LENGTH) {
+                        // Simple truncation. Consider hashing for better collision avoidance if needed.
+                        finalIndexName = proposedIndexName.substring(0, ORACLE_MAX_IDENTIFIER_LENGTH);
+                        Logger log = Logger.get(OracleClient.class);
+                        log.warn("Generated index name '%s' truncated to '%s' due to length limit (%d)",
+                                proposedIndexName, finalIndexName, ORACLE_MAX_IDENTIFIER_LENGTH);
+                    }
+                    else {
+                        finalIndexName = proposedIndexName;
+                    }
+
+                    // Note: indexColumns are not quoted here. Users should quote within the spec if needed.
+                    // Example: CREATE INDEX "I_MYTABLE_MYINDEX" ON "MYSCHEMA"."MYTABLE"(Col1, "Col 2")
+                    createTableSqlsBuilder.add(
+                            format("CREATE INDEX %s ON %s(%s)",
+                                    quoted(finalIndexName), // Use the new, potentially truncated name
+                                    quoted(remoteTableName),
+                                    indexColumns));
+                }
             }
         }
+
+        Optional<String> tableComment = tableMetadata.getComment();
         if (tableComment.isPresent()) {
             createTableSqlsBuilder.add(buildTableCommentSql(remoteTableName, tableComment));
         }
