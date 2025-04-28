@@ -420,15 +420,51 @@ public class OracleClient
                             + indexSpec);
                 }
                 String indexColumns = indexSpec.substring(pos1 + 1, pos2);
-                String tableName = remoteTableName.getTableName();
-                if (tableName.length() >= 5) {
-                    tableName = tableName.substring(tableName.length() - 5);
+                String originalTableName = remoteTableName.getTableName();
+                String tableNamePrefix = originalTableName;
+                // Use a shorter prefix of the table name (max 8 chars)
+                int maxTableNamePrefixLength = 8;
+                if (tableNamePrefix.length() > maxTableNamePrefixLength) {
+                    tableNamePrefix = tableNamePrefix.substring(0, maxTableNamePrefixLength);
                 }
 
-                String indexName = "I" + tableName + "_" + indexSpec.substring(0, pos1);
+                String indexSpecName = indexSpec.substring(0, pos1);
+                // Use a shorter prefix of the index spec name (max 5 chars)
+                int maxSpecNameLength = 5;
+                if (indexSpecName.length() > maxSpecNameLength) {
+                    indexSpecName = indexSpecName.substring(0, maxSpecNameLength);
+                }
+
+                // Generate a shorter hash suffix from the full original table name (max 4 chars)
+                String hashSuffix = Integer.toHexString(Objects.hash(originalTableName));
+                int maxHashSuffixLength = 4; // Use last 4 hex chars for suffix
+                if (hashSuffix.length() > maxHashSuffixLength) {
+                    hashSuffix = hashSuffix.substring(hashSuffix.length() - maxHashSuffixLength);
+                }
+                else if (hashSuffix.length() < maxHashSuffixLength) {
+                    // Pad with leading zeros if shorter
+                    hashSuffix = "0".repeat(maxHashSuffixLength - hashSuffix.length()) + hashSuffix;
+                }
+
+                // Generate a time-based suffix for uniqueness across recreations (max 8 chars)
+                String timeSuffix = Long.toHexString(System.nanoTime());
+                int maxTimeSuffixLength = 8; // Use last 8 hex chars of nanoTime
+                if (timeSuffix.length() > maxTimeSuffixLength) {
+                    timeSuffix = timeSuffix.substring(timeSuffix.length() - maxTimeSuffixLength);
+                }
+                else if (timeSuffix.length() < maxTimeSuffixLength) {
+                    // Pad with leading zeros if shorter
+                    timeSuffix = "0".repeat(maxTimeSuffixLength - timeSuffix.length()) + timeSuffix;
+                }
+
+                // Construct a highly unique index name: I_<prefix>_<spec>_<hash>_<time> (approx. 2 + 8 + 1 + 5 + 1 + 4 + 1 + 8 = 30 chars)
+                String indexName = "I_" + tableNamePrefix + "_" + indexSpecName + "_" + hashSuffix + "_" + timeSuffix;
+
+                // Ensure index name is uppercase as Oracle identifiers are case-insensitive by default but stored uppercase
+                // Quoting preserves case but can lead to issues if not consistently used. Sticking to uppercase is safer.
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
-                                quoted(indexName),
+                                quoted(indexName.toUpperCase(ENGLISH)), // Ensure index name is uppercase
                                 quoted(remoteTableName),
                                 indexColumns));
             }
