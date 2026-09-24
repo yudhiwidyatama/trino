@@ -513,7 +513,21 @@ public class OracleClient
                             + indexSpec);
                 }
                 String indexColumns = indexSpec.substring(pos1 + 1, pos2);
-                String indexName = indexSpec.substring(0, pos1);
+                String tableName = remoteTableName.getTableName();
+                if (tableName.length() >= 5) {
+                    tableName = tableName.substring(tableName.length() - 5);
+                }
+
+                // Generate a unique index name using timestamp
+                // Ensure total length is 30 chars max: IDX(3) + _(1) + tableName(5) + _(1) + timestamp(19) = 29 chars max
+                String timestamp = String.valueOf(System.currentTimeMillis());
+                String indexName = "IDX_" + tableName + "_" + timestamp;
+                if (indexName.length() > 30) {
+                    // If still too long, trim the timestamp while preserving uniqueness
+                    int excessLength = indexName.length() - 30;
+                    timestamp = timestamp.substring(excessLength);
+                    indexName = "IDX_" + tableName + "_" + timestamp;
+                }
                 createTableSqlsBuilder.add(
                         format("CREATE INDEX %s ON %s(%s)",
                                 quoted(indexName),
