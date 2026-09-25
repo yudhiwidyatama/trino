@@ -94,7 +94,6 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -492,18 +491,12 @@ public class OracleClient
     @Override
     protected List<String> createTableSqls(RemoteTableName remoteTableName, List<String> columns, ConnectorTableMetadata tableMetadata)
     {
-        java.util.Set<String> propKeys0 = tableMetadata.getProperties().keySet();
-        HashSet<String> propKeys = new HashSet<String>(propKeys0);
-        if (propKeys.contains("index")) {
-            propKeys.remove("index");
-        }
-        checkArgument(propKeys.isEmpty(), "Unsupported table properties: %s", propKeys.toString());
         ImmutableList.Builder<String> createTableSqlsBuilder = ImmutableList.builder();
         createTableSqlsBuilder.add(format("CREATE TABLE %s (%s)", quoted(remoteTableName), join(", ", columns)));
         Optional<String> tableComment = tableMetadata.getComment();
         if (tableMetadata.getProperties().containsKey("index")) {
-            List<String> indexspecs = (List<String>) tableMetadata.getProperties().get("index");
-            for (String indexSpec : indexspecs) {
+            List<String> indexSpecs = (List<String>) tableMetadata.getProperties().get("index");
+            for (String indexSpec : indexSpecs) {
                 int pos1 = indexSpec.indexOf("(");
                 int pos2 = indexSpec.indexOf(")");
                 if ((pos1 < 0) || (pos2 < 0)) {
