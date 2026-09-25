@@ -18,8 +18,6 @@ import io.trino.plugin.jdbc.TablePropertiesProvider;
 import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.type.ArrayType;
 
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
 import static io.trino.spi.type.VarcharType.VARCHAR;
@@ -27,12 +25,12 @@ import static io.trino.spi.type.VarcharType.VARCHAR;
 public class OracleTableProperties
         implements TablePropertiesProvider
 {
-    private final List<PropertyMetadata<?>> props;
+    private final List<PropertyMetadata<?>> tableProperties;
 
     OracleTableProperties()
     {
-        props = Collections.unmodifiableList(Arrays.asList(
-                new PropertyMetadata<>(
+        tableProperties = ImmutableList.<PropertyMetadata<?>>builder()
+                .add(new PropertyMetadata<>(
                         "index",
                         "Indexes",
                         new ArrayType(VARCHAR),
@@ -40,12 +38,13 @@ public class OracleTableProperties
                         ImmutableList.of(),
                         false,
                         value -> (List<?>) value,
-                        value -> value)));
+                        value -> value))
+                .build();
     }
 
     @Override
     public List<PropertyMetadata<?>> getTableProperties()
     {
-        return props;
+        return tableProperties;
     }
 }

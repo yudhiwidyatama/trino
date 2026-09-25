@@ -94,8 +94,8 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
 import java.util.Collection;
-import java.util.Iterator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -492,7 +492,6 @@ public class OracleClient
     @Override
     protected List<String> createTableSqls(RemoteTableName remoteTableName, List<String> columns, ConnectorTableMetadata tableMetadata)
     {
-        //checkArgument(tableMetadata.getProperties().isEmpty(), "Unsupported table properties: %s", tableMetadata.getProperties());
         java.util.Set<String> propKeys0 = tableMetadata.getProperties().keySet();
         HashSet<String> propKeys = new HashSet<String>(propKeys0);
         if (propKeys.contains("index")) {
@@ -508,9 +507,7 @@ public class OracleClient
                 int pos1 = indexSpec.indexOf("(");
                 int pos2 = indexSpec.indexOf(")");
                 if ((pos1 < 0) || (pos2 < 0)) {
-                    throw new TrinoException(JDBC_ERROR, "" +
-                            "Index spec invalid format, expected indexname(col1,col2,...) but found "
-                            + indexSpec);
+                    throw new TrinoException(JDBC_ERROR, "Index spec invalid format, expected indexname(col1,col2,...) but found " + indexSpec);
                 }
                 String indexColumns = indexSpec.substring(pos1 + 1, pos2);
                 String tableName = remoteTableName.getTableName();
