@@ -1,16 +1,21 @@
-# Implementation Plan: MySQL Wire Protocol to Trino REST API Gateway (`trino-mysql-proxy`)
+# Implementation Plan: MySQL Wire Protocol to Trino REST API Gateway
 
 ## 1. Executive Summary
 
-This document outlines the architecture and phased implementation plan for a new standalone Trino service module, `service/trino-mysql-proxy`, that accepts client connections over the **MySQL binary wire protocol (v4.1 / HandshakeV10)** and translates them into **Trino Client REST API (`/v1/statement`)** calls.
+This document outlines the architecture and phased implementation plan to enable **MySQL binary wire protocol (v4.1 / HandshakeV10)** support for Trino by translating MySQL protocol commands into **Trino Client REST API (`/v1/statement`)** calls.
 
-The design is modeled directly on **Apache Doris Frontend's (FE) MySQL network protocol layer**, adapted to Trino's Airlift/Guice service conventions (`service/trino-proxy`) and backed by Trino's existing `client/trino-client` REST client library.
+The design is modeled directly on **Apache Doris Frontend's (FE) MySQL network protocol layer**, adapted to Trino's Airlift/Guice module architecture and backed by Trino's existing `client/trino-client` REST client library.
+
+It supports **two deployment modes** — both running **in parallel with Trino's original HTTP(S) REST port (`8080`/`8443`)** without disrupting Trino CLI, Trino JDBC, Web UI, or REST clients:
+
+1. **Embedded Coordinator Mode** *(like Apache Doris FE)*: Wired conditionally into Trino's `CoordinatorModule` (`mysql-protocol.enabled=true`). When a Trino Coordinator starts, it opens both the standard Jetty HTTP(S) port and the Netty MySQL TCP port inside the same JVM, forwarding translated requests over loopback to the coordinator's `/v1/statement` endpoint.
+2. **Standalone Proxy Mode** *(like `service/trino-proxy`)*: Runs as an independent JVM service (`service/trino-mysql-proxy`) listening on a MySQL TCP port and forwarding requests over HTTP(S) to any remote Trino Coordinator's `/v1/statement` endpoint.
 
 ---
 
 ## 2. Reference Analysis: How Apache Doris Receives MySQL Protocol Requests
 
-In Apache Doris (`apache/doris`), the MySQL wire protocol server is embedded inside the Java Frontend (`fe/fe-core`) and listens on `Config.query_port` (default `9030`).
+In Apache Doris (`apache/doris`), the MySQL wire protocol server is embedded inside the Java Frontend (`fe/fe-core`) and listens on `Config.query_port` (default `9030`), running alongside Doris FE's Jetty HTTP server.
 
 ### 2.1 End-to-End Request Lifecycle in Apache Doris
 
@@ -77,7 +82,7 @@ DorisFE.start() [DorisFE.java:308-312]
 
 | Responsibility | Apache Doris File (`fe/fe-core/src/main/java/org/apache/doris/`) | Key Mechanism |
 | --- | --- | --- |
-| Service bootstrap | `DorisFE.java`, `qe/QeService.java`, `tls/server/OssFeServerStarterProvider.java` | Starts `MysqlServer` on `Config.query_port` (9030) |
+| Service bootstrap | `DorisFE.java`, `qe/QeService.java`, `tls/server/OssFeServerStarterProvider.java` | Starts `MysqlServer` on `Config.query_port` (9030) alongside Jetty HTTP server |
 | Non-blocking TCP server | `mysql/MysqlServer.java` | JBoss XNIO `XnioWorker` + `AcceptingChannel<StreamConnection>` + worker `ExecutorService` |
 | Connection accept & lifecycle | `mysql/AcceptListener.java` | Accepts socket, creates `ConnectContext`, runs handshake on worker thread, registers `ReadListener` |
 | Event-driven request trigger | `mysql/ReadListener.java` | Suspends reads on IO thread, executes `processOnce()` on worker pool, resumes reads on completion |
@@ -88,27 +93,63 @@ DorisFE.start() [DorisFE.java:308-312]
 
 ---
 
-## 3. Target Architecture in Trino
+## 3. Target Architecture in Trino (Dual-Mode: Embedded + Standalone)
 
-### 3.1 Placement & Runtime Model
+### 3.1 Clean Module Split (Preventing Maven Dependency Cycles)
 
-Create a new standalone Maven module under `service/`:
+To support **both** embedded coordinator mode and standalone proxy mode cleanly without creating a circular Maven dependency between `core/trino-main` and `service/trino-mysql-proxy` (whose integration tests depend on `trino-main`'s `TestingTrinoServer`), the implementation is split into two new modules plus minimal conditional wiring in `core/trino-main`:
 
-- **Module path**: `service/trino-mysql-proxy` (registered in root `pom.xml` alongside `service/trino-proxy` and `service/trino-verifier`).
-- **Bootstrap framework**: Airlift (`Bootstrap`, `NodeModule`, `JmxModule`, `LogJmxModule`, `TracingModule`, `Configuration`), matching `service/trino-proxy/src/main/java/io/trino/proxy/TrinoProxy.java`.
-- **Network transport**: **Netty** (`io.netty:netty-transport`, `io.netty:netty-handler`, `io.netty:netty-codec`) instead of JBoss XNIO. Netty is already version-managed in Trino's root `pom.xml` (`io.netty:netty-bom`), provides native `ByteToMessageDecoder` / `MessageToByteEncoder` framing pipelines, clean `SslHandler` mid-connection TLS upgrades, and channel writability backpressure.
-- **Trino REST client**: Reuse Trino's own `client/trino-client` (`StatementClientFactory`, `StatementClient`, `ClientSession`, `ProtocolHeaders`, `QueryResults`, `OkHttpClient`). This avoids re-implementing Trino's HTTP protocol (`/v1/statement`, `/v1/statement/queued/...`, `/v1/statement/executing/...`, retry logic, response header parsing, and `FixJsonDataUtils`).
+1. **`lib/trino-mysql-protocol`** *(reusable protocol library + Guice `MysqlProtocolModule`)*
+   - Contains the entire Netty MySQL TCP/TLS server, packet codecs, handshake/auth logic, session manager, command dispatcher, compatibility interceptor, and Trino REST bridge.
+   - Depends **only** on `client/trino-client`, `io.netty` (already managed in Trino's root `pom.xml` via `io.netty:netty-bom`), `io.airlift.*`, Guice, and Guava — **zero dependency on `trino-main`**.
+   - Exposes a single `MysqlTargetUriProvider` interface so embedded mode and standalone mode each supply the target Trino `/v1/statement` URI cleanly.
+2. **`core/trino-main` (Embedded Coordinator Mode)**
+   - Adds a compile dependency on `lib/trino-mysql-protocol`.
+   - In `CoordinatorModule` (which `ServerMainModule` installs **only** when `ServerConfig.isCoordinator()` is `true`, so worker nodes never open a MySQL port), conditionally installs `EmbeddedMysqlProtocolModule` when `mysql-protocol.enabled=true` (default `false`).
+   - Resolves `MysqlTargetUriProvider` automatically from Trino's `HttpServerInfo` (`httpServerInfo.getHttpsUri()` when HTTPS is enabled, otherwise `httpServerInfo.getHttpUri()`, with optional override via `mysql-protocol.trino-uri`).
+   - Starts `MysqlNettyServer` in parallel with Jetty HTTP(S) (`8080`/`8443`) and hooks into coordinator shutdown (`@PreDestroy`).
+3. **`service/trino-mysql-proxy` (Standalone Proxy Service & End-to-End Test Host)**
+   - Thin Airlift `Bootstrap` service (mirroring `service/trino-proxy/src/main/java/io/trino/proxy/TrinoProxy.java`) depending on `lib/trino-mysql-protocol`.
+   - Binds `MysqlTargetUriProvider` directly from the required `mysql-protocol.trino-uri` config property and always enables the MySQL listener.
+   - Hosts packaging/assembly and `TestingTrinoServer` integration tests covering **both** embedded mode and standalone mode.
 
-### 3.2 High-Level Architecture Diagram
+### 3.2 Dual-Mode Deployment Architecture
+
+```text
+Mode A: Embedded inside Trino Coordinator JVM (mysql-protocol.enabled=true)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           Trino Coordinator JVM                            │
+│                                                                            │
+│  Trino CLI / JDBC / Web UI ──► Jetty HTTP(S) Server (:8080 / :8443)        │
+│                                     ▲  /v1/statement                       │
+│                                     │  (loopback HTTP/HTTPS via            │
+│                                     │   HttpServerInfo)                    │
+│  MySQL Clients ──────────────► Netty MysqlNettyServer (:3306 / :9030)      │
+│                                (lib/trino-mysql-protocol in                │
+│                                 CoordinatorModule)                         │
+└────────────────────────────────────────────────────────────────────────────┘
+
+Mode B: Standalone Sidecar / Proxy JVM (service/trino-mysql-proxy)
+┌─────────────────────────┐          ┌───────────────────────────────────────┐
+│  service/trino-mysql-   │ HTTP(S)  │         Trino Coordinator JVM         │
+│  proxy JVM              │ /v1/stmt │                                       │
+│                         ├─────────►│ Jetty HTTP(S) Server (:8080 / :8443)  │
+│  MySQL Clients ──►:3306 │          │   ▲                                   │
+│  (lib/trino-mysql-      │          │   │                                   │
+│   protocol)             │          │ Trino CLI / JDBC / Web UI             │
+└─────────────────────────┘          └───────────────────────────────────────┘
+```
+
+### 3.3 Internal Request Pipeline (`lib/trino-mysql-protocol`)
 
 ```text
 ┌────────────────────────────────────────────────────────┐
 │   MySQL Clients (mysql CLI, Connector/J, PyMySQL, BI)  │
 └──────────────────────────┬─────────────────────────────┘
-                           │ TCP / Optional TLS (default port 3306 or 9030)
+                           │ TCP / Optional TLS (mysql-protocol.listen-port)
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                       service/trino-mysql-proxy                         │
+│                        lib/trino-mysql-protocol                         │
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │ Netty I/O Layer (Boss/Worker EventLoopGroup)                      │  │
@@ -137,6 +178,7 @@ Create a new standalone Maven module under `service/`:
 │                                 ▼                                       │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │ Trino REST Bridge & Wire Encoder                                  │  │
+│  │  • MysqlTargetUriProvider (HttpServerInfo OR configured URI)      │  │
 │  │  • TrinoStatementExecutor (wraps io.trino.client.StatementClient) │  │
 │  │  • TrinoSessionSynchronizer (applies X-Trino-Set-* headers)       │  │
 │  │  • TrinoToMysqlTypeMapper (ClientTypeSignature -> FIELD_TYPE_*)   │  │
@@ -155,11 +197,11 @@ Create a new standalone Maven module under `service/`:
 └────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 Component Mapping: Apache Doris vs. `trino-mysql-proxy`
+### 3.4 Component Mapping: Apache Doris vs. Trino
 
-| Apache Doris Component | Proposed Trino Equivalent (`io.trino.mysqlproxy.*`) | Notes |
+| Apache Doris Component | Proposed Trino Equivalent | Notes |
 | --- | --- | --- |
-| `QeService` + `MysqlServer` | `TrinoMysqlProxy` + `MysqlProxyModule` + `MysqlNettyServer` | Airlift lifecycle (`@PostConstruct` / `@PreDestroy`) managing Netty boss/worker groups and query executor pool |
+| `DorisFE` + `QeService` + `MysqlServer` | `lib/trino-mysql-protocol` (`MysqlNettyServer` + `MysqlProtocolModule`) hosted by either `CoordinatorModule` (embedded) or `TrinoMysqlProxy` (standalone) | Airlift `@PostConstruct` / `@PreDestroy` lifecycle managing Netty boss/worker groups and query executor pool |
 | `AcceptListener` | `MysqlNettyServer` `ChannelInitializer` + `MysqlConnectionHandler.channelActive()` | Allocates `connectionId`, creates `MysqlSession`, sends `HandshakeV10` |
 | `ReadListener` | `MysqlConnectionHandler.channelRead0()` with `ChannelConfig.setAutoRead(false/true)` | Mirrors Doris's suspend/resume pattern so at most one command executes per connection at a time without blocking Netty I/O threads |
 | `MysqlChannel` | `MysqlPacketDecoder` + `MysqlPacketEncoder` + `MysqlWireWriter` | Handles 4-byte framing, sequence ID verification/reset, >16 MiB packet reassembly/splitting, `max_allowed_packet`, TLS `SslHandler` insertion |
@@ -174,15 +216,15 @@ Create a new standalone Maven module under `service/`:
 ## 4. Proposed Module & Package Layout
 
 ```text
-service/trino-mysql-proxy/
-├── pom.xml
+lib/trino-mysql-protocol/
+├── pom.xml                                       # Depends on trino-client, io.netty, io.airlift.*
 └── src/
-    ├── main/java/io/trino/mysqlproxy/
-    │   ├── TrinoMysqlProxy.java                  # Entry point (Airlift Bootstrap)
-    │   ├── MysqlProxyModule.java                 # Guice bindings & config
-    │   ├── MysqlProxyConfig.java                 # Listen host/port, Trino URI, TLS, auth mode, timeouts, thread pool sizes
+    ├── main/java/io/trino/mysqlprotocol/
+    │   ├── MysqlProtocolModule.java              # Reusable Guice module (installs server, dispatcher, stats)
+    │   ├── MysqlProtocolConfig.java              # Shared config (enabled, host, port, TLS, auth, timeouts, pools)
+    │   ├── MysqlTargetUriProvider.java           # Interface supplying target Trino coordinator URI + TLS trust
     │   ├── server/
-    │   │   ├── MysqlNettyServer.java             # Netty ServerBootstrap lifecycle
+    │   │   ├── MysqlNettyServer.java             # Netty ServerBootstrap lifecycle (@PostConstruct/@PreDestroy)
     │   │   ├── MysqlPacketDecoder.java           # 4-byte header + >16 MiB reassembly + sequence check
     │   │   ├── MysqlPacketEncoder.java           # 4-byte header + >16 MiB splitting + sequence increment
     │   │   ├── MysqlConnectionHandler.java       # Per-connection state machine (HANDSHAKE -> COMMAND -> CLOSED)
@@ -220,38 +262,66 @@ service/trino-mysql-proxy/
     │   │   ├── MysqlBinaryResultEncoder.java     # Encodes QueryData rows in MySQL Binary Resultset format
     │   │   └── TrinoErrorMapper.java             # QueryError -> MySQL error code + 5-char SQLSTATE
     │   └── metrics/
-    │       └── MysqlProxyStats.java              # JMX counters (active connections, queries, errors, bytes)
-    └── test/java/io/trino/mysqlproxy/
+    │       └── MysqlProtocolStats.java           # JMX counters (active connections, queries, errors, bytes)
+    └── test/java/io/trino/mysqlprotocol/
         ├── protocol/                             # Wire packet codec & framing unit tests
         ├── execution/                            # Type mapping, error mapping, variable interception tests
-        ├── mock/                                 # OkHttp MockWebServer + Connector/J tests
-        └── integration/                          # TestingTrinoServer + Connector/J end-to-end tests
+        └── mock/                                 # OkHttp MockWebServer + Connector/J tests
+
+core/trino-main/src/main/java/io/trino/server/
+├── CoordinatorModule.java                        # Conditionally installs EmbeddedMysqlProtocolModule
+└── mysql/
+    └── EmbeddedMysqlProtocolModule.java          # Binds MysqlTargetUriProvider from HttpServerInfo + installs MysqlProtocolModule
+
+service/trino-mysql-proxy/
+├── pom.xml                                       # Depends on lib/trino-mysql-protocol (+ trino-main in test scope)
+└── src/
+    ├── main/java/io/trino/mysqlproxy/
+    │   ├── TrinoMysqlProxy.java                  # Standalone entry point (Airlift Bootstrap)
+    │   ├── MysqlProxyStandaloneModule.java       # Binds MysqlTargetUriProvider from config + installs MysqlProtocolModule
+    │   └── MysqlProxyStandaloneConfig.java       # Requires mysql-protocol.trino-uri for standalone mode
+    └── test/java/io/trino/mysqlproxy/integration/
+        ├── TestEmbeddedMysqlProtocol.java        # TestingTrinoServer with mysql-protocol.enabled=true + Connector/J
+        └── TestStandaloneMysqlProxy.java         # TestingTrinoServer + standalone TrinoMysqlProxy + Connector/J
 ```
 
 ---
 
 ## 5. Detailed Protocol-to-REST Translation Design
 
-### 5.1 Configuration (`MysqlProxyConfig`)
+### 5.1 Configuration (`MysqlProtocolConfig`)
 
-| Config Property | Default | Description |
-| --- | --- | --- |
-| `mysql-proxy.listen-host` | `0.0.0.0` | Bind address for the MySQL TCP server |
-| `mysql-proxy.listen-port` | `3306` | TCP port for MySQL wire protocol clients |
-| `mysql-proxy.trino-uri` | *(required)* | Target Trino coordinator URI (e.g., `https://trino.example.com:8443`) |
-| `mysql-proxy.default-catalog` | *(optional)* | Default Trino catalog if client does not specify a DB |
-| `mysql-proxy.default-schema` | *(optional)* | Default Trino schema if client does not specify a DB |
-| `mysql-proxy.server-version` | `8.0.32-trino` | Version banner in `HandshakeV10` (must look like MySQL 8.0.x for JDBC/ORM compatibility) |
-| `mysql-proxy.auth-mode` | `TRUSTED_USER` | `TRUSTED_USER` (forwards MySQL username via `X-Trino-User`), `BASIC_CLEAR_PASSWORD` (uses `mysql_clear_password` over TLS to send HTTP Basic Auth to Trino), or `STATIC_TOKEN` |
-| `mysql-proxy.tls.enabled` | `false` | Enables `CLIENT_SSL` advertisement and mid-handshake TLS upgrade |
-| `mysql-proxy.tls.keystore-path` / `keystore-password` | *(optional)* | Server certificate/key for MySQL TLS |
-| `mysql-proxy.max-allowed-packet` | `64MB` | Upper bound on incoming logical MySQL packet payload size |
-| `mysql-proxy.max-connections` | `1024` | Connection pool cap (mirrors Doris `ConnectPoolMgr`) |
-| `mysql-proxy.io-threads` | `Runtime.availableProcessors()` | Netty worker event-loop threads |
-| `mysql-proxy.query-threads` | `256` | Executor pool threads for blocking `StatementClient` REST polling |
-| `mysql-proxy.idle-timeout` | `8h` | Idle connection cleanup timeout |
+| Config Property | Default | Mode | Description |
+| --- | --- | --- | --- |
+| `mysql-protocol.enabled` | `false` *(embedded)* / `true` *(standalone)* | Both | Enables the MySQL wire protocol listener on a Trino Coordinator |
+| `mysql-protocol.listen-host` | `0.0.0.0` | Both | Bind address for the MySQL TCP server |
+| `mysql-protocol.listen-port` | `3306` | Both | TCP port for MySQL wire protocol clients (separate from Trino HTTP(S) `8080`/`8443`) |
+| `mysql-protocol.trino-uri` | Auto from `HttpServerInfo` *(embedded)* / **required** *(standalone)* | Both | Target Trino Coordinator REST URI |
+| `mysql-protocol.trino-tls-truststore-path` / `truststore-password` / `insecure-skip-verify` | *(optional)* | Both | TLS verification settings for outbound HTTPS calls to Trino (supports self-signed/loopback coordinator certs in embedded mode) |
+| `mysql-protocol.default-catalog` | *(optional)* | Both | Default Trino catalog if client does not specify a DB |
+| `mysql-protocol.default-schema` | *(optional)* | Both | Default Trino schema if client does not specify a DB |
+| `mysql-protocol.single-db-name-target` | `SCHEMA` (if default catalog set) / `CATALOG` | Both | How to interpret a single-part DB name without `.` |
+| `mysql-protocol.server-version` | `8.0.32-trino` | Both | Version banner in `HandshakeV10` (must look like MySQL 8.0.x for JDBC/ORM compatibility) |
+| `mysql-protocol.auth-mode` | `TRUSTED_USER` | Both | `TRUSTED_USER` (forwards MySQL username via `X-Trino-User`), `BASIC_CLEAR_PASSWORD` (uses `mysql_clear_password` over TLS to send HTTP Basic Auth to Trino), or `STATIC_TOKEN` |
+| `mysql-protocol.tls.enabled` | `false` | Both | Enables `CLIENT_SSL` advertisement and mid-handshake TLS upgrade for MySQL clients |
+| `mysql-protocol.tls.keystore-path` / `keystore-password` | *(optional)* | Both | Server certificate/key for MySQL client TLS |
+| `mysql-protocol.max-allowed-packet` | `64MB` | Both | Upper bound on incoming logical MySQL packet payload size |
+| `mysql-protocol.max-connections` | `1024` | Both | Connection pool cap (mirrors Doris `ConnectPoolMgr`) |
+| `mysql-protocol.io-threads` | `Runtime.availableProcessors()` | Both | Netty worker event-loop threads |
+| `mysql-protocol.query-threads` | `256` | Both | Executor pool threads for blocking `StatementClient` REST polling |
+| `mysql-protocol.idle-timeout` | `8h` | Both | Idle connection cleanup timeout |
 
-### 5.2 Handshake, TLS Upgrade, and Authentication
+### 5.2 Embedded Coordinator Lifecycle & Loopback Behavior
+
+When `mysql-protocol.enabled=true` on a Trino Coordinator:
+
+1. **Coordinator-only activation**: Registered inside `CoordinatorModule` via `install(conditionalModule(MysqlProtocolConfig.class, MysqlProtocolConfig::isEnabled, new EmbeddedMysqlProtocolModule()))`. Worker nodes (`coordinator=false`) never bind a MySQL port or allocate Netty pools.
+2. **Parallel port binding**: Trino's Jetty HTTP(S) server continues listening on `http-server.http.port` / `http-server.https.port` (e.g., `8080`/`8443`), while `MysqlNettyServer` binds independently to `mysql-protocol.listen-port` (e.g., `3306` or `9030`). Startup validates that the MySQL port does not collide with the configured HTTP(S) port.
+3. **Loopback URI resolution**: `EmbeddedMysqlProtocolModule` provides `MysqlTargetUriProvider` using injected `HttpServerInfo` (`httpServerInfo.getHttpsUri()` if HTTPS is enabled, else `httpServerInfo.getHttpUri()`), honoring an explicit `mysql-protocol.trino-uri` override if configured (e.g., when fronting behind an internal load balancer).
+4. **Loopback HTTPS trust**: When the coordinator uses HTTPS, `EmbeddedMysqlProtocolModule` can either use `mysql-protocol.trino-tls-truststore-path` or automatically derive trust from the coordinator's configured `HttpServerConfig` keystore/truststore so loopback calls work out of the box without disabling certificate validation.
+5. **Graceful shutdown**: `MysqlNettyServer`'s `@PreDestroy` stops accepting new TCP connections, cancels in-flight `StatementClient` calls, drains/closes active channels, and shuts down Netty and query thread pools cleanly when the coordinator shuts down.
+
+### 5.3 Handshake, TLS Upgrade, and Authentication
 
 1. **Initial Handshake (`HandshakeV10Packet`)**:
    - On `channelActive`, generate a unique `connectionId` and 20-byte random scramble, then send `HandshakeV10` with `sequenceId = 0`.
@@ -260,21 +330,21 @@ service/trino-mysql-proxy/
 2. **Optional TLS Upgrade (`SslRequestPacket`)**:
    - Inspect the first 4 bytes (client capability flags) of the client's first packet (`sequenceId = 1`).
    - If `CLIENT_SSL` is set:
-     - If TLS is disabled on the proxy, send `ERR_Packet` and close.
+     - If TLS is disabled, send `ERR_Packet` and close.
      - Otherwise, dynamically insert Netty's `SslHandler` at the head of the pipeline and await the next packet (`HandshakeResponse41`, `sequenceId = 2`) over TLS.
 3. **Authentication Bridge to Trino**:
    - **Challenge**: MySQL's default `mysql_native_password` and `caching_sha2_password` transmit salted password hashes, whereas Trino's REST API password authenticators expect HTTP `Authorization: Basic base64(user:plaintext)` (or Bearer JWT).
    - **Supported modes**:
-     - `TRUSTED_USER` (default for internal/unauthenticated Trino): accept `mysql_native_password` with empty/any password and set `X-Trino-User: <mysqlUser>` on `ClientSession`.
-     - `BASIC_CLEAR_PASSWORD` (for password-authenticated Trino clusters): advertise `mysql_clear_password` (or emit `AuthSwitchRequest` to `mysql_clear_password`), **enforce TLS** so plaintext passwords never cross unencrypted networks, extract the NUL-terminated plaintext password, and attach an OkHttp Basic Auth interceptor to the session's `OkHttpClient`. Optionally validate credentials immediately via a lightweight `GET /v1/info` or `SELECT 1` before returning `OK_Packet`.
+     - `TRUSTED_USER` (for internal/unauthenticated Trino): accept `mysql_native_password` with empty/any password and set `X-Trino-User: <mysqlUser>` on `ClientSession`.
+     - `BASIC_CLEAR_PASSWORD` (for password-authenticated Trino clusters): advertise `mysql_clear_password` (or emit `AuthSwitchRequest` to `mysql_clear_password`), **enforce TLS** so plaintext passwords never cross unencrypted networks, extract the NUL-terminated plaintext password, and attach an OkHttp Basic Auth interceptor to the session's `OkHttpClient`. Optionally validate credentials immediately via `GET /v1/info` or `SELECT 1` before returning `OK_Packet`.
 4. **Database -> Catalog / Schema Mapping**:
    - MySQL has a 1-level database hierarchy (`db`), whereas Trino has a 2-level hierarchy (`catalog.schema`).
    - Convention for `HandshakeResponse41.database` and `COM_INIT_DB`:
      - `"catalog.schema"` -> `catalog = "catalog"`, `schema = "schema"`.
-     - `"catalog"` -> if `default-catalog` is unset, treat as `catalog` (schema unset); if `default-catalog` is set and the identifier contains no `.`, treat as `schema` under the current/default catalog (configurable via `mysql-proxy.single-db-name-target=CATALOG|SCHEMA`).
-     - Validate by executing `USE <target>` against Trino or updating `ClientSession` directly (validating via `USE` returns authentic Trino errors for unknown catalog/schema).
+     - `"catalog"` -> interpreted according to `mysql-protocol.single-db-name-target` (default: `schema` when `default-catalog` is set, otherwise `catalog`).
+     - Validated by executing `USE <target>` against Trino so authentic Trino errors are returned for unknown catalog/schema.
 
-### 5.3 MySQL Command-to-Trino REST Mapping
+### 5.4 MySQL Command-to-Trino REST Mapping
 
 | MySQL Command | Opcode | Trino REST Translation | Response Packets |
 | --- | --- | --- | --- |
@@ -294,7 +364,7 @@ service/trino-mysql-proxy/
 | `COM_STATISTICS` | `0x09` | Return proxy uptime/query stats string | EOF-terminated string packet |
 | Other unsupported commands | — | Return `ER_UNKNOWN_COM_ERROR (1047)` | `ERR_Packet` |
 
-### 5.4 Streaming Execution Loop (`TrinoStatementExecutor`)
+### 5.5 Streaming Execution Loop (`TrinoStatementExecutor`)
 
 To avoid buffering entire Trino result sets in memory, `TrinoStatementExecutor` streams results incrementally as `StatementClient` polls `nextUri`:
 
@@ -316,14 +386,14 @@ To avoid buffering entire Trino result sets in memory, `TrinoStatementExecutor` 
      - `getSetCatalog()`, `getSetSchema()`, `getSetPath()`, `getSetSessionProperties()`, `getResetSessionProperties()`, `getSetRoles()`, `getAddedPreparedStatements()`, `getDeallocatedPreparedStatements()`, `getStartedTransactionId()`, `isClearTransactionId()`, `getSetAuthorizationUser()`, `isResetAuthorizationUser()`.
    - Inspect `QueryStatusInfo finalStatus = client.finalStatusInfo()`:
      - If `client.isClientAborted()` or `client.isClientError()` or `finalStatus.getError() != null`:
-       - Map error via `TrinoErrorMapper` and send `ErrPacket` (note: if `headerSent` is true, MySQL clients accept an `ERR_Packet` mid-resultset in place of the terminating EOF/OK packet).
+       - Map error via `TrinoErrorMapper` and send `ErrPacket` (if `headerSent` is true, MySQL clients accept an `ERR_Packet` mid-resultset in place of the terminating EOF/OK packet).
      - Else if `headerSent`:
        - Send `ResultSetEndPacket` (`0xFE` OK packet) if `CLIENT_DEPRECATE_EOF` is negotiated, otherwise `EofPacket`.
      - Else (DML / DDL / `USE` / `SET SESSION` with no result columns):
        - Send `OkPacket` with `affectedRows = Optional.ofNullable(finalStatus.getUpdateCount()).orElse(0L)` and `warnings = finalStatus.getWarnings().size()`.
 5. Always flush, clear `session.clearActiveStatement()`, close `client`, and re-enable `ctx.channel().config().setAutoRead(true)` on the Netty event loop.
 
-### 5.5 Trino-to-MySQL Data Type Mapping (`TrinoToMysqlTypeMapper`)
+### 5.6 Trino-to-MySQL Data Type Mapping (`TrinoToMysqlTypeMapper`)
 
 `trino-client` normalizes JSON row values via `FixJsonDataUtils` into Java objects (`Boolean`, `Byte`, `Short`, `Integer`, `Long`, `Float`, `Double`, `String`, `byte[]`, `List`, `Map`, `Row`). Each `ClientTypeSignature` maps to a MySQL wire column definition as follows:
 
@@ -347,13 +417,13 @@ To avoid buffering entire Trino result sets in memory, `TrinoStatementExecutor` 
 | `json` | `MYSQL_TYPE_JSON` (or `VAR_STRING`) | `0xF5` / `0xFD` | UTF-8 JSON string | Length-encoded UTF-8 JSON string |
 | `uuid`, `ipaddress`, `interval *`, `array`, `map`, `row`, other | `MYSQL_TYPE_VAR_STRING` | `0xFD` | String / JSON serialization | Length-encoded UTF-8 string |
 
-### 5.6 MySQL Client & BI Tool Compatibility Layer (`MysqlSystemVariableHandler`)
+### 5.7 MySQL Client & BI Tool Compatibility Layer (`MysqlSystemVariableHandler`)
 
-Standard MySQL clients (`mysql` CLI, MySQL Connector/J 8/9, PyMySQL, Go `go-sql-driver/mysql`, DBeaver, Tableau) automatically emit metadata/session probe queries immediately after connecting, before any user SQL runs. If forwarded verbatim to Trino, these fail with syntax errors.
+Standard MySQL clients (`mysql` CLI, MySQL Connector/J 8/9, PyMySQL, Go `go-sql-driver/mysql`, DBeaver, Tableau) emit metadata/session probe queries immediately after connecting, before any user SQL runs. If forwarded verbatim to Trino, these fail with syntax errors.
 
 The compatibility interceptor handles a focused, well-tested set of probe patterns locally (returning synthetic MySQL result sets or `OK_Packet`):
 
-- `SELECT @@version_comment LIMIT 1` -> returns configured version comment (e.g., `Trino MySQL Protocol Proxy`).
+- `SELECT @@version_comment LIMIT 1` -> returns configured version comment (e.g., `Trino MySQL Protocol`).
 - `SELECT @@version` / `SELECT VERSION()` -> returns configured server version banner.
 - Connector/J bootstrap multi-variable `SELECT @@session.auto_increment_increment AS ..., @@character_set_client AS ..., @@max_allowed_packet AS ..., @@sql_mode AS ..., @@time_zone AS ..., @@transaction_isolation AS ...` -> returns sensible defaults (UTF-8mb4, `max_allowed_packet`, current session time zone, `READ-COMMITTED`).
 - `SET NAMES ...`, `SET character_set_results = ...`, `SET autocommit = ...`, `SET sql_mode = ...`, `SET net_write_timeout = ...`, `SET SESSION transaction ...` -> return `OK_Packet` (and map `SET time_zone = '...'` directly to `ClientSession.timeZone`).
@@ -361,9 +431,9 @@ The compatibility interceptor handles a focused, well-tested set of probe patter
 - `SELECT DATABASE()` -> return current `catalog.schema` (or `schema`) from `ClientSession`.
 - `KILL [QUERY | CONNECTION] <connectionId>` -> look up target `MysqlSession` in `MysqlSessionRegistry` and invoke `activeStatement.close()` (and close channel if `KILL CONNECTION`).
 
-A config flag (`mysql-proxy.compat-interceptor.enabled=true`) allows operators to disable or customize interception if desired.
+A config flag (`mysql-protocol.compat-interceptor.enabled=true`) allows operators to disable interception if desired.
 
-### 5.7 Error Mapping (`TrinoErrorMapper`)
+### 5.8 Error Mapping (`TrinoErrorMapper`)
 
 Translate Trino `QueryError` (`errorCode`, `errorName`, `errorType`, `message`) into MySQL `ERR_Packet` (`0xFF`, 2-byte error code, `#`, 5-char SQLSTATE, message):
 
@@ -383,28 +453,29 @@ Translate Trino `QueryError` (`errorCode`, `errorName`, `errorType`, `message`) 
 
 ## 6. Phased Implementation Roadmap
 
-### Phase 1 — Module Scaffolding, Netty Wire Framing & Handshake
-- Add `service/trino-mysql-proxy` module and register it in root `pom.xml`.
-- Implement `TrinoMysqlProxy`, `MysqlProxyModule`, `MysqlProxyConfig`.
+### Phase 1 — Core Module Scaffolding (`lib/trino-mysql-protocol`), Netty Wire Framing & Handshake
+- Add `lib/trino-mysql-protocol` and `service/trino-mysql-proxy` modules and register both in root `pom.xml`.
+- Implement `MysqlProtocolConfig`, `MysqlProtocolModule`, and `MysqlTargetUriProvider`.
 - Implement `MysqlPacketBuffer`, `MysqlPacketDecoder` (4-byte header, sequence ID checks, >16 MiB packet reassembly, `max_allowed_packet` enforcement), and `MysqlPacketEncoder` (>16 MiB packet splitting).
 - Implement `HandshakeV10Packet`, `HandshakeResponse41Packet`, `OkPacket`, `ErrPacket`, `EofPacket`, `ResultSetEndPacket`.
 - Implement `MysqlNettyServer`, `MysqlConnectionHandler` (with auto-read suspend/resume), `MysqlSession`, `MysqlSessionRegistry`.
 - Handle `COM_PING` and `COM_QUIT`.
 - **Exit Criteria**: Standard `mysql` CLI and MySQL Connector/J can connect, complete handshake, ping, and cleanly disconnect.
 
-### Phase 2 — Trino REST Execution (`COM_QUERY`, `COM_INIT_DB`) & Text Result Streaming
+### Phase 2 — Trino REST Execution (`COM_QUERY`, `COM_INIT_DB`), Text Streaming & Dual-Mode Wiring
 - Implement `TrinoClientFactory`, `TrinoStatementExecutor`, and `TrinoSessionSynchronizer` on top of `io.trino.client.StatementClientFactory`.
 - Implement `ColumnDefinition41Packet`, `TrinoToMysqlTypeMapper`, `MysqlTextResultEncoder`, and `TrinoErrorMapper`.
-- Implement `COM_QUERY` streaming (columns -> rows -> `EOF`/`ResultSetEndPacket`, or `OK_Packet` for DML/DDL) and `COM_INIT_DB`.
-- Implement client disconnect cancellation (`channelInactive` -> `activeStatement.close()`).
-- **Exit Criteria**: `SELECT`, `SHOW CATALOGS`, `SHOW SCHEMAS`, `SHOW TABLES`, `USE`, `INSERT`, `CREATE TABLE`, and `SET SESSION` work end-to-end against `TestingTrinoServer` from `mysql` CLI and Connector/J.
+- Implement `COM_QUERY` streaming (columns -> rows -> `EOF`/`ResultSetEndPacket`, or `OK_Packet` for DML/DDL), `COM_INIT_DB`, and disconnect cancellation (`channelInactive` -> `activeStatement.close()`).
+- Wire **Standalone Mode**: `TrinoMysqlProxy` + `MysqlProxyStandaloneModule` in `service/trino-mysql-proxy`.
+- Wire **Embedded Coordinator Mode**: `EmbeddedMysqlProtocolModule` in `core/trino-main`'s `CoordinatorModule` (enabled via `mysql-protocol.enabled=true`, resolving target URI from `HttpServerInfo` in parallel with Jetty HTTP(S)).
+- **Exit Criteria**: Both standalone proxy and embedded coordinator modes pass `SELECT`, `SHOW CATALOGS/SCHEMAS/TABLES`, `USE`, `INSERT`, `CREATE TABLE`, and `SET SESSION` end-to-end while Trino's HTTP(S) REST port simultaneously serves Trino JDBC queries.
 
 ### Phase 3 — Driver Compatibility, TLS Upgrade & Password Auth
 - Implement `MysqlSystemVariableHandler` for Connector/J 8/9, PyMySQL, `mysql` CLI, and BI tool initialization queries.
-- Implement `SslRequestPacket` and dynamic Netty `SslHandler` insertion (`mysql-proxy.tls.enabled=true`).
-- Implement `mysql_clear_password` (`AuthSwitchRequestPacket`) over TLS forwarding credentials as HTTP Basic Auth to Trino.
+- Implement `SslRequestPacket` and dynamic Netty `SslHandler` insertion (`mysql-protocol.tls.enabled=true`).
+- Implement `mysql_clear_password` (`AuthSwitchRequestPacket`) over TLS forwarding credentials as HTTP Basic Auth to Trino, plus loopback HTTPS trust handling for embedded mode.
 - Implement `COM_FIELD_LIST`, `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, `COM_SET_OPTION`, `COM_STATISTICS`, and `KILL QUERY` / `KILL CONNECTION`.
-- **Exit Criteria**: MySQL Connector/J 8.x/9.x, PyMySQL, and `mysql --ssl-mode=REQUIRED` connect cleanly with default driver settings and execute queries without workarounds.
+- **Exit Criteria**: MySQL Connector/J 8.x/9.x, PyMySQL, and `mysql --ssl-mode=REQUIRED` connect cleanly with default driver settings in both standalone and embedded modes.
 
 ### Phase 4 — Server-Side Prepared Statements & Binary Resultset Protocol
 - Implement `MysqlPreparedStatementManager` for `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, `COM_STMT_CLOSE`, `COM_STMT_RESET`, and `COM_STMT_SEND_LONG_DATA`.
@@ -414,38 +485,42 @@ Translate Trino `QueryError` (`errorCode`, `errorName`, `errorType`, `message`) 
 - **Exit Criteria**: JDBC `PreparedStatement` with `useServerPrepStmts=true` works for parameterized `SELECT` queries across all common scalar types.
 
 ### Phase 5 — Observability, Hardening & Packaging
-- Add JMX metrics (`MysqlProxyStats`: active/total connections, active/failed queries, rows/bytes streamed, auth failures) and OpenTelemetry tracing spans linked to `X-Trino-Trace-Token`.
-- Add idle connection eviction (`IdleStateHandler`), connection limits, and write-timeout backpressure enforcement.
-- Add executable packaging/assembly (following `service/trino-proxy`) and operator documentation under `docs/src/`.
-- **Exit Criteria**: Load/soak tests verify bounded memory under large streaming result sets (e.g., millions of rows) and clean cancellation under client disconnects.
+- Add JMX metrics (`MysqlProtocolStats`: active/total connections, active/failed queries, rows/bytes streamed, auth failures) and OpenTelemetry tracing spans linked to `X-Trino-Trace-Token`.
+- Add idle connection eviction (`IdleStateHandler`), connection limits, port-collision checks against `HttpServerConfig`, and write-timeout backpressure enforcement.
+- Add standalone executable packaging/assembly (following `service/trino-proxy`) and operator documentation under `docs/src/` covering both embedded and standalone deployments.
+- **Exit Criteria**: Load/soak tests verify bounded memory under large streaming result sets and clean coordinator/proxy shutdown without port leaks.
 
 ---
 
 ## 7. Testing & Verification Strategy
 
-1. **Protocol Unit Tests** (`protocol/`):
+1. **Protocol Unit Tests** (`lib/trino-mysql-protocol/src/test/.../protocol/` & `execution/`):
    - Round-trip serialization/deserialization of every MySQL packet type (`HandshakeV10`, `HandshakeResponse41`, `ColumnDefinition41`, `OkPacket`, `ErrPacket`, `EofPacket`, `ResultSetEndPacket`, `StmtPrepareOkPacket`).
    - Sequence ID wrapping (`255 -> 0`), >16 MiB (`0xFFFFFF`) multi-packet splitting and reassembly, and `max_allowed_packet` rejection.
    - `CLIENT_DEPRECATE_EOF` enabled vs. disabled framing verification.
    - `TrinoToMysqlTypeMapper`, `MysqlTextResultEncoder`, `MysqlBinaryResultEncoder`, and `TrinoErrorMapper` coverage for every `ClientStandardTypes` value including `NULL`, edge timestamps, decimals, binary blobs, arrays, maps, and rows.
-2. **Mock Trino Coordinator Tests** (`mock/`):
+2. **Mock Trino Coordinator Tests** (`lib/trino-mysql-protocol/src/test/.../mock/`):
    - Use OkHttp `MockWebServer` (already used in `trino-client` tests) to simulate multi-page `/v1/statement` responses, `X-Trino-Set-*` headers, HTTP 401/503 retries, mid-stream `QueryError`, and `DELETE` cancellation verification when a MySQL client disconnects.
-3. **End-to-End Integration Tests** (`integration/`):
-   - Boot an in-process `TestingTrinoServer` with `tpch` and `memory` connectors (matching `service/trino-proxy/pom.xml` test dependencies) behind `MysqlNettyServer`.
-   - Run real **MySQL Connector/J** tests (both `useServerPrepStmts=false` and `useServerPrepStmts=true`, with and without TLS) executing TPC-H queries, DDL/DML on `memory`, session property changes, transactions, large streaming result sets, and `KILL QUERY`.
+3. **Dual-Mode End-to-End Integration Tests** (`service/trino-mysql-proxy/src/test/.../integration/`):
+   - **`TestEmbeddedMysqlProtocol`**: Boot `TestingTrinoServer` with `mysql-protocol.enabled=true` and an ephemeral `mysql-protocol.listen-port=0`; verify **simultaneous** execution of queries from **Trino JDBC** (on the Jetty HTTP(S) port) and **MySQL Connector/J** (on the MySQL TCP port), verifying worker nodes do not open MySQL ports and coordinator shutdown closes both cleanly.
+   - **`TestStandaloneMysqlProxy`**: Boot `TestingTrinoServer` (with embedded MySQL disabled) behind a standalone `TrinoMysqlProxy` instance; verify TPC-H queries, DDL/DML on `memory`, `useServerPrepStmts=false/true`, TLS + `mysql_clear_password`, session properties, transactions, large streaming result sets, and `KILL QUERY`.
 
 ---
 
 ## 8. Risks, Trade-offs & Open Questions
 
-1. **Authentication Protocol Mismatch**:
-   - MySQL's `mysql_native_password` and `caching_sha2_password` cannot expose the plaintext password to an intermediary, so forwarding passwords to Trino HTTP Basic Auth requires `mysql_clear_password` (which must require TLS and may require `--enable-cleartext-plugin` on older `mysql` CLI builds).
+1. **Embedded vs. Standalone Operational Trade-offs**:
+   - *Embedded mode* offers single-process deployment (like Apache Doris FE) with zero extra infrastructure, but shares JVM heap/CPU with the coordinator (mitigated by strict `max-connections`, `max-allowed-packet`, and streaming backpressure).
+   - *Standalone mode* isolates memory/restarts and scales horizontally in front of a coordinator cluster, at the cost of running an additional service.
+   - Supporting both via the shared `lib/trino-mysql-protocol` module gives operators the choice without duplicating protocol code.
+2. **Authentication Protocol Mismatch**:
+   - MySQL's `mysql_native_password` and `caching_sha2_password` cannot expose the plaintext password to an intermediary, so forwarding passwords to Trino HTTP Basic Auth requires `mysql_clear_password` (which must enforce TLS and may require `--enable-cleartext-plugin` on older `mysql` CLI builds).
    - *Mitigation*: Support both `TRUSTED_USER` (for trusted networks / gateway deployments) and `BASIC_CLEAR_PASSWORD` over TLS, and consider optional JWT/OAuth token pass-through in the password field.
-2. **SQL Dialect Differences**:
+3. **SQL Dialect Differences**:
    - Trino speaks ANSI SQL, whereas MySQL tools sometimes emit MySQL-specific syntax (backtick `` `ident` `` quoting, `LIMIT offset, count`, `SHOW DATABASES`, `SELECT @@...`).
    - *Decision*: Keep SQL rewriting minimal by design — intercept only well-known driver bootstrap/metadata probes (`MysqlSystemVariableHandler`), and document that user queries use Trino SQL (optional backtick-to-double-quote rewriting can be evaluated later as an opt-in config).
-3. **Mid-Stream Failures**:
+4. **Mid-Stream Failures**:
    - Because results stream to the MySQL client as Trino pages arrive, a Trino execution failure occurring *after* `ColumnDefinition41` packets have been written cannot send a clean top-level error; it sends an `ERR_Packet` instead of the terminating `EOF`/`ResultSetEndPacket`, which modern MySQL drivers surface as a `SQLException` during `ResultSet.next()`.
-4. **Prepared Statement Latency**:
+5. **Prepared Statement Latency**:
    - Mapping `COM_STMT_PREPARE` to three Trino REST round-trips (`PREPARE`, `DESCRIBE INPUT`, `DESCRIBE OUTPUT`) adds setup latency per prepared statement.
    - *Mitigation*: Cache prepared statement metadata per session and allow clients using `useServerPrepStmts=false` (Connector/J default) to bypass `COM_STMT_PREPARE` completely.
