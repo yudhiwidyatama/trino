@@ -492,7 +492,23 @@ Translate Trino `QueryError` (`errorCode`, `errorName`, `errorType`, `message`) 
 
 ---
 
-## 7. Testing & Verification Strategy
+## 7. Implementation Methodology (Hybrid Outside-In ATDD + Protocol-Layer TDD) & Testing Strategy
+
+### 7.1 Development Workflow (3-Layer Test-First Loop)
+
+Because binary wire protocols are sensitive to byte-level bugs while real MySQL drivers (Connector/J 8/9, `mysql` CLI, PyMySQL) enforce subtle version-specific framing and bootstrap expectations, implementation follows a **Hybrid Outside-In ATDD + Protocol-Layer TDD** loop delivered in vertical slices:
+
+1. **Outer Ring — Real Driver Acceptance Test First (ATDD)**:
+   - Start each vertical slice by writing a failing test with **real MySQL Connector/J** against `MysqlNettyServer` (backed by OkHttp `MockWebServer` in `lib/trino-mysql-protocol` for fast deterministic iteration, and `TestingTrinoServer` in `service/trino-mysql-proxy` for true end-to-end verification).
+   - Real drivers act as the protocol oracle, exposing quirks like Connector/J's initial `SELECT @@...` probes and `CLIENT_DEPRECATE_EOF` 0xFE packet length requirements immediately.
+2. **Inner Ring — Strict TDD for Wire Framing, Codecs & Mappers**:
+   - Drive deterministic byte-level and translation logic with fast red-green-refactor unit tests (<1s):
+     - `MysqlPacketBuffer`, `MysqlPacketDecoder`, and `MysqlPacketEncoder` tested via **Netty `EmbeddedChannel`** (fragmented TCP reads, sequence wrapping `255 -> 0`, >16 MiB packet splitting/reassembly, `max_allowed_packet` rejection).
+     - All protocol packet classes, `TrinoToMysqlTypeMapper`, `MysqlTextResultEncoder`, `MysqlBinaryResultEncoder`, `TrinoErrorMapper`, `TrinoSessionSynchronizer`, and `MysqlSystemVariableHandler`.
+3. **Fast-Feedback Build Split**:
+   - Keep day-to-day TDD and `MockWebServer` acceptance tests in `lib/trino-mysql-protocol` (`./mvnw test -pl lib/trino-mysql-protocol`), and run the heavier dual-mode `TestingTrinoServer` integration tests in `service/trino-mysql-proxy` (`./mvnw test -pl service/trino-mysql-proxy`) at the end of each slice.
+
+### 7.2 Test Suite Breakdown
 
 1. **Protocol Unit Tests** (`lib/trino-mysql-protocol/src/test/.../protocol/` & `execution/`):
    - Round-trip serialization/deserialization of every MySQL packet type (`HandshakeV10`, `HandshakeResponse41`, `ColumnDefinition41`, `OkPacket`, `ErrPacket`, `EofPacket`, `ResultSetEndPacket`, `StmtPrepareOkPacket`).
