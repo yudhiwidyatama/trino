@@ -286,6 +286,11 @@
 
         <dependency>
             <groupId>io.trino</groupId>
+            <artifactId>trino-mysql-protocol</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.trino</groupId>
             <artifactId>trino-parser</artifactId>
         </dependency>
 

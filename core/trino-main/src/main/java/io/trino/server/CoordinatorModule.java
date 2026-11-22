@@ -103,8 +103,10 @@ import io.trino.memory.TotalReservationOnBlockedNodesTaskLowMemoryKiller;
 import io.trino.metadata.LanguageFunctionManager;
 import io.trino.metadata.LanguageFunctionProvider;
 import io.trino.metadata.Split;
+import io.trino.mysqlprotocol.MysqlProtocolConfig;
 import io.trino.operator.ForScheduler;
 import io.trino.operator.OperatorStats;
+import io.trino.server.mysql.EmbeddedMysqlProtocolModule;
 import io.trino.server.protocol.ExecutingStatementResource;
 import io.trino.server.protocol.QueryInfoUrlFactory;
 import io.trino.server.remotetask.RemoteTaskStats;
@@ -366,6 +368,12 @@ public class CoordinatorModule
         executionPolicyBinder.addBinding("phased").to(PhasedExecutionPolicy.class);
 
         install(new QueryExecutionFactoryModule());
+
+        // optional embedded MySQL wire protocol listener (parallel with HTTP/S REST server)
+        install(conditionalModule(
+                MysqlProtocolConfig.class,
+                MysqlProtocolConfig::isEnabled,
+                new EmbeddedMysqlProtocolModule()));
 
         // cleanup
         closingBinder(binder).registerExecutor(Key.get(ExecutorService.class, ForStatementResource.class));

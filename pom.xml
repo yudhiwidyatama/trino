@@ -54,6 +54,7 @@
         <module>lib/trino-matching</module>
         <module>lib/trino-memory-context</module>
         <module>lib/trino-metastore</module>
+        <module>lib/trino-mysql-protocol</module>
         <module>lib/trino-orc</module>
         <module>lib/trino-parquet</module>
         <module>lib/trino-plugin-toolkit</module>
@@ -117,6 +118,7 @@
         <module>plugin/trino-thrift-testing-server</module>
         <module>plugin/trino-tpcds</module>
         <module>plugin/trino-tpch</module>
+        <module>service/trino-mysql-proxy</module>
         <module>service/trino-proxy</module>
         <module>service/trino-verifier</module>
         <module>testing/trino-benchmark-queries</module>
@@ -1284,6 +1286,12 @@
                 <artifactId>trino-mysql</artifactId>
                 <version>${project.version}</version>
                 <type>test-jar</type>
+            </dependency>
+
+            <dependency>
+                <groupId>io.trino</groupId>
+                <artifactId>trino-mysql-protocol</artifactId>
+                <version>${project.version}</version>
             </dependency>
 
             <dependency>
