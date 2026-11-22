@@ -6,6 +6,7 @@ ENV MAVEN_OPTS="-Xmx4g"
 COPY . /workspace
 
 RUN set -xeuo pipefail && \
+    microdnf install -y gzip && \
     # Reuse prebuilt Web UI static assets from trino:454 to avoid Node/npm downloads in build pod
     mkdir -p core/trino-web-ui/target/classes && \
     (cd core/trino-web-ui/target/classes && "${JAVA_HOME}/bin/jar" xf /usr/lib/trino/lib/trino-web-ui-454.jar webapp webapp-preview oauth2) && \
