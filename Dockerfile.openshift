@@ -10,6 +10,7 @@ RUN set -xeuo pipefail && \
     # Reuse prebuilt Web UI static assets from trino:454 to avoid Node/npm downloads in build pod
     mkdir -p core/trino-web-ui/target/classes && \
     (cd core/trino-web-ui/target/classes && "${JAVA_HOME}/bin/jar" xf /usr/lib/trino/lib/trino-web-ui-454.jar webapp webapp-preview oauth2) && \
+    python3 -c "p='core/trino-web-ui/pom.xml'; s=open(p).read(); open(p,'w').write(s[:s.index('<plugins>')]+s[s.index('</plugins>')+10:])" && \
     # Use the slimmed OpenShift provisio descriptor with only the needed connectors/plugins
     cp core/trino-server/src/main/provisio/trino-openshift.xml core/trino-server/src/main/provisio/trino.xml && \
     # Step 1: Compile and install required modules and plugins into local m2 repo
@@ -19,7 +20,7 @@ RUN set -xeuo pipefail && \
         -Dmaven.gitcommitid.skip=true \
         -Dskip.installnodenpm=true \
         -Dskip.npm=true \
-        -pl client/trino-cli,core/trino-server-main,service/trino-mysql-proxy,plugin/trino-exchange-filesystem,plugin/trino-hive,plugin/trino-hdfs,plugin/trino-iceberg,plugin/trino-jmx,plugin/trino-memory,plugin/trino-mysql,plugin/trino-oracle,plugin/trino-password-authenticators,plugin/trino-postgresql,plugin/trino-resource-group-managers,plugin/trino-session-property-managers,plugin/trino-tpcds,plugin/trino-tpch \
+        -pl client/trino-cli,core/trino-server-main,service/trino-mysql-proxy,plugin/trino-exchange-filesystem,plugin/trino-hive,lib/trino-hdfs,plugin/trino-iceberg,plugin/trino-jmx,plugin/trino-memory,plugin/trino-mysql,plugin/trino-oracle,plugin/trino-password-authenticators,plugin/trino-postgresql,plugin/trino-resource-group-managers,plugin/trino-session-property-managers,plugin/trino-tpcds,plugin/trino-tpch \
         -am && \
     # Step 2: Assemble trino-server-455-SNAPSHOT.tar.gz via provisio after all plugins are in local m2
     ./mvnw -B package \
