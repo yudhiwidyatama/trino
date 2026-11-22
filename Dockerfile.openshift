@@ -1,0 +1,49 @@
+FROM harbor.telkom.co.id/dockerhub-proxy/trinodb/trino:454 AS builder
+USER 0
+WORKDIR /workspace
+ENV MAVEN_OPTS="-Xmx4g"
+
+COPY . /workspace
+
+RUN set -xeuo pipefail && \
+    # Reuse prebuilt Web UI static assets from trino:454 to avoid Node/npm downloads in build pod
+    mkdir -p core/trino-web-ui/target/classes && \
+    (cd core/trino-web-ui/target/classes && "${JAVA_HOME}/bin/jar" xf /usr/lib/trino/lib/trino-web-ui-454.jar webapp webapp-preview oauth2) && \
+    # Use the slimmed OpenShift provisio descriptor with only the needed connectors/plugins
+    cp core/trino-server/src/main/provisio/trino-openshift.xml core/trino-server/src/main/provisio/trino.xml && \
+    # Step 1: Compile and install required modules and plugins into local m2 repo
+    ./mvnw -B -T 2C install \
+        -DskipTests \
+        -Dair.check.skip-all=true \
+        -Dmaven.gitcommitid.skip=true \
+        -Dskip.installnodenpm=true \
+        -Dskip.npm=true \
+        -pl client/trino-cli,core/trino-server-main,service/trino-mysql-proxy,plugin/trino-exchange-filesystem,plugin/trino-hive,plugin/trino-hdfs,plugin/trino-iceberg,plugin/trino-jmx,plugin/trino-memory,plugin/trino-mysql,plugin/trino-oracle,plugin/trino-password-authenticators,plugin/trino-postgresql,plugin/trino-resource-group-managers,plugin/trino-session-property-managers,plugin/trino-tpcds,plugin/trino-tpch \
+        -am && \
+    # Step 2: Assemble trino-server-455-SNAPSHOT.tar.gz via provisio after all plugins are in local m2
+    ./mvnw -B package \
+        -DskipTests \
+        -Dair.check.skip-all=true \
+        -Dmaven.gitcommitid.skip=true \
+        -Denforcer.skip=true \
+        -pl core/trino-server && \
+    # Step 3: Unpack server assembly and overlay core/docker/bin & libjvmkill.so
+    mkdir -p /staging && \
+    python3 -c "import tarfile; t = tarfile.open('core/trino-server/target/trino-server-455-SNAPSHOT.tar.gz'); t.extractall('/staging'); t.close()" && \
+    cp -R core/docker/bin/* /staging/trino-server-455-SNAPSHOT/bin/ && \
+    cp /usr/lib/trino/bin/libjvmkill.so /staging/trino-server-455-SNAPSHOT/bin/ && \
+    cp client/trino-cli/target/trino-cli-455-SNAPSHOT-executable.jar /staging/trino && \
+    chmod +x /staging/trino /staging/trino-server-455-SNAPSHOT/bin/*
+
+FROM harbor.telkom.co.id/dockerhub-proxy/trinodb/trino:454
+USER 0
+RUN rm -rf /usr/lib/trino/* /usr/bin/trino
+COPY --chown=trino:trino --from=builder /staging/trino /usr/bin/trino
+COPY --chown=trino:trino --from=builder /staging/trino-server-455-SNAPSHOT /usr/lib/trino
+COPY --chown=trino:trino core/docker/default/etc /etc/trino
+
+EXPOSE 8080 3306
+USER trino:trino
+CMD ["/usr/lib/trino/bin/run-trino"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s \
+  CMD /usr/lib/trino/bin/health-check
