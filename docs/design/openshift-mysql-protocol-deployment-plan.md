@@ -10,12 +10,13 @@
 - [x] Created this deployment plan document (`docs/design/openshift-mysql-protocol-deployment-plan.md`)
 - [x] Step 2: Backed up existing OpenShift configurations (`deployment`, `configmap`, `service`, `pvc`) to `openshift-backups/2026-11-22/`
 - [x] Step 3: Authored `core/trino-server/src/main/provisio/trino-openshift.xml` and `Dockerfile.openshift`, committed, and pushed to GitLab (`mysql-protocol-proxy-plan`)
+- [x] Step 4: Created Git source secret (`trino-gitlab-secret`), `ImageStream` (`trino`), and `BuildConfig` (`trino-mysql-proxy`) in `epd-financeapps`, and completed OpenShift Docker build (`trino-mysql-proxy-3` → `image-registry.openshift-image-registry.svc:5000/epd-financeapps/trino:455-mysql-proxy`)
+- [x] Step 5: Enabled embedded MySQL wire protocol (`mysql-protocol.enabled=true`, port `3306`) in `configmap/trino-chart-coordinator`, exposed port `3306/TCP` on `service/trino-chart`, and created `NodePort` service `service/trino-chart-mysql-np` (`3306:31485/TCP`, ClusterIP `172.19.205.214`)
+- [x] Step 6: Unmounted legacy `442` plugin PVCs (`mysqlplugin2`, `oraplugin2`), configured `imagePullSecrets` (`deployer-dockercfg-gvhnw`, `default-dockercfg-j88t9`) and `rollingUpdate: {maxSurge: 0, maxUnavailable: 1}`, and switched `trino-chart-coordinator` and `trino-chart-worker` to `image-registry.openshift-image-registry.svc:5000/epd-financeapps/trino:455-mysql-proxy`
+- [x] Step 7: Verified rollout (`1/1` coordinator + `3/3` workers `active` in `system.runtime.nodes`), all 25 catalogs (`24` configured + `system`), and MySQL wire protocol listener on port `3306` (`8.0.32-trino` handshake)
 
 ### In Progress / Pending
-- [ ] Step 4: Create Git source secret (`trino-gitlab-secret`), `ImageStream` (`trino`), and `BuildConfig` (`trino-mysql-proxy`) in `epd-financeapps`, and run OpenShift Docker build
-- [ ] Step 5: Enable embedded MySQL wire protocol (`mysql-protocol.enabled=true`, port `3306`) in `configmap/trino-chart-coordinator` and expose port `3306` on `service/trino-chart`
-- [ ] Step 6: Unmount legacy `442` plugin PVCs (`mysqlplugin2`, `oraplugin2`) and switch `trino-chart-coordinator` and `trino-chart-worker` to `image-registry.openshift-image-registry.svc:5000/epd-financeapps/trino:455-mysql-proxy`
-- [ ] Step 7: Verify rollout, cluster health (`455-SNAPSHOT`), 24 catalogs, and MySQL wire protocol listener on port `3306`
+- *(None — all planned steps completed)*
 
 ---
 
