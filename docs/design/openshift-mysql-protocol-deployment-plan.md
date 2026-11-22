@@ -14,11 +14,12 @@
 - [x] Step 5: Enabled embedded MySQL wire protocol (`mysql-protocol.enabled=true`, port `3306`) in `configmap/trino-chart-coordinator`, exposed port `3306/TCP` on `service/trino-chart`, and created `NodePort` service `service/trino-chart-mysql-np` (`3306:31485/TCP`, ClusterIP `172.19.205.214`)
 - [x] Step 6: Unmounted legacy `442` plugin PVCs (`mysqlplugin2`, `oraplugin2`), configured `imagePullSecrets` (`deployer-dockercfg-gvhnw`, `default-dockercfg-j88t9`) and `rollingUpdate: {maxSurge: 0, maxUnavailable: 1}`, and switched `trino-chart-coordinator` and `trino-chart-worker` to `image-registry.openshift-image-registry.svc:5000/epd-financeapps/trino:455-mysql-proxy`
 - [x] Step 7: Verified rollout (`1/1` coordinator + `3/3` workers `active` in `system.runtime.nodes`), all 25 catalogs (`24` configured + `system`), and MySQL wire protocol listener on port `3306` (`8.0.32-trino` handshake)
+- [x] Step 8: Implemented `MysqlSqlPreprocessor` (backquoted identifiers `` `...` `` -> `"..."`, `#` comments -> `--`, `LIMIT offset, count` -> `OFFSET offset LIMIT count`) and Sequel Pro / MySQL GUI metadata query compatibility (`SHOW DATABASES`, `SHOW [FULL] TABLES`, `SHOW TABLE STATUS`, `SHOW [FULL] COLUMNS/FIELDS`, `SHOW CREATE TABLE`, `SHOW INDEX/KEYS`, `SHOW ENGINES/TRIGGERS/PROCEDURE STATUS/FUNCTION STATUS`) in `lib/trino-mysql-protocol`
+- [x] Step 9: Ran unit tests for `lib/trino-mysql-protocol`, committed (`0210760ae6b`), and pushed to `mysql-protocol-proxy-plan` on GitLab and GitHub
+- [x] Step 10: Built updated OpenShift image (`trino-mysql-proxy-4` → `sha256:ac2bbb6ad28e8e46390f6051c14246669a849d772fe906230ffe9a91082faf1f`) and rolled out to `trino-chart-coordinator` (`1/1`) and `trino-chart-worker` (`3/3`)
 
 ### In Progress / Pending
-- [ ] Step 8: Implement `MysqlSqlPreprocessor` (backquoted identifiers `` `...` `` -> `"..."`, `#` comments -> `--`, `LIMIT offset, count` -> `OFFSET offset LIMIT count`) and Sequel Pro / MySQL GUI metadata query compatibility (`SHOW DATABASES`, `SHOW [FULL] TABLES`, `SHOW TABLE STATUS`, `SHOW [FULL] COLUMNS/FIELDS`, `SHOW CREATE TABLE`, `SHOW INDEX/KEYS`, `SHOW ENGINES/TRIGGERS/PROCEDURE STATUS/FUNCTION STATUS`) in `lib/trino-mysql-protocol`
-- [ ] Step 9: Run unit tests for `lib/trino-mysql-protocol`, commit, and push to `mysql-protocol-proxy-plan` on GitLab
-- [ ] Step 10: Trigger OpenShift build (`oc48 start-build trino-mysql-proxy --follow`) and roll out updated `trino:455-mysql-proxy` image to `trino-chart-coordinator` and `trino-chart-worker`
+- *(None — all planned steps completed)*
 
 ---
 
