@@ -17,6 +17,7 @@ import com.google.inject.Binder;
 import com.google.inject.Module;
 import com.google.inject.Scopes;
 import io.trino.mysqlprotocol.execution.MysqlCommandDispatcher;
+import io.trino.mysqlprotocol.execution.MysqlMetadataQueryHandler;
 import io.trino.mysqlprotocol.execution.MysqlSystemVariableHandler;
 import io.trino.mysqlprotocol.execution.TrinoStatementExecutor;
 import io.trino.mysqlprotocol.metrics.MysqlProtocolStats;
@@ -47,6 +48,7 @@ public class MysqlProtocolModule
         binder.bind(MysqlAuthenticator.class).in(Scopes.SINGLETON);
         binder.bind(TrinoStatementExecutor.class).in(Scopes.SINGLETON);
         binder.bind(MysqlSystemVariableHandler.class).in(Scopes.SINGLETON);
+        binder.bind(MysqlMetadataQueryHandler.class).in(Scopes.SINGLETON);
         binder.bind(MysqlCommandDispatcher.class).in(Scopes.SINGLETON);
         binder.bind(MysqlNettyServer.class).in(Scopes.SINGLETON);
     }

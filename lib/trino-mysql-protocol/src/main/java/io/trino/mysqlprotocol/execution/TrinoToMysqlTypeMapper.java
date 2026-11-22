@@ -178,10 +178,15 @@ public final class TrinoToMysqlTypeMapper
 
     public static ColumnDefinition41Packet stringColumn(String name)
     {
+        return stringColumn("", "", name);
+    }
+
+    public static ColumnDefinition41Packet stringColumn(String schema, String table, String name)
+    {
         return new ColumnDefinition41Packet(
-                "",
-                "",
-                "",
+                schema,
+                table,
+                table,
                 name,
                 name,
                 CHARSET_UTF8MB4,

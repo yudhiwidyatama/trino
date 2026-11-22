@@ -18,6 +18,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.trino.client.ClientSession;
 import io.trino.mysqlprotocol.MysqlProtocolConfig;
+import io.trino.mysqlprotocol.execution.TrinoStatementExecutor.InternalQueryResult;
+import io.trino.mysqlprotocol.execution.TrinoStatementExecutor.MysqlQueryException;
 import io.trino.mysqlprotocol.metrics.MysqlProtocolStats;
 import io.trino.mysqlprotocol.protocol.MysqlCommand;
 import io.trino.mysqlprotocol.protocol.MysqlPacketBuffer;
@@ -26,14 +28,15 @@ import io.trino.mysqlprotocol.protocol.packet.ErrPacket;
 import io.trino.mysqlprotocol.protocol.packet.OkPacket;
 import io.trino.mysqlprotocol.protocol.packet.ResultSetEndPacket;
 import io.trino.mysqlprotocol.server.MysqlSessionRegistry;
-import io.trino.mysqlprotocol.session.MysqlAuthenticator;
 import io.trino.mysqlprotocol.session.MysqlSession;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static io.trino.mysqlprotocol.execution.MysqlMetadataQueryHandler.quoteIdentifier;
 import static io.trino.mysqlprotocol.execution.TrinoStatementExecutor.writePacket;
 import static io.trino.mysqlprotocol.execution.TrinoStatementExecutor.writePacketAndFlush;
 import static java.util.Objects.requireNonNull;
@@ -46,14 +49,17 @@ public class MysqlCommandDispatcher
     private static final Pattern KILL_PATTERN = Pattern.compile(
             "^KILL\\s+(?:(QUERY|CONNECTION)\\s+)?(\\d+)\\s*;?$",
             Pattern.CASE_INSENSITIVE);
+    private static final Pattern USE_SINGLE_IDENTIFIER_PATTERN = Pattern.compile(
+            "^USE\\s+([A-Za-z0-9_]+|\"(?:[^\"]|\"\")+\")\\s*$",
+            Pattern.CASE_INSENSITIVE);
 
     private final TrinoStatementExecutor statementExecutor;
     private final MysqlSystemVariableHandler systemVariableHandler;
+    private final MysqlMetadataQueryHandler metadataQueryHandler;
     private final MysqlSessionRegistry sessionRegistry;
     private final MysqlProtocolConfig config;
     private final MysqlProtocolStats stats;
 
-    @Inject
     public MysqlCommandDispatcher(
             TrinoStatementExecutor statementExecutor,
             MysqlSystemVariableHandler systemVariableHandler,
@@ -61,8 +67,27 @@ public class MysqlCommandDispatcher
             MysqlProtocolConfig config,
             MysqlProtocolStats stats)
     {
+        this(
+                statementExecutor,
+                systemVariableHandler,
+                new MysqlMetadataQueryHandler(config, statementExecutor),
+                sessionRegistry,
+                config,
+                stats);
+    }
+
+    @Inject
+    public MysqlCommandDispatcher(
+            TrinoStatementExecutor statementExecutor,
+            MysqlSystemVariableHandler systemVariableHandler,
+            MysqlMetadataQueryHandler metadataQueryHandler,
+            MysqlSessionRegistry sessionRegistry,
+            MysqlProtocolConfig config,
+            MysqlProtocolStats stats)
+    {
         this.statementExecutor = requireNonNull(statementExecutor, "statementExecutor is null");
         this.systemVariableHandler = requireNonNull(systemVariableHandler, "systemVariableHandler is null");
+        this.metadataQueryHandler = requireNonNull(metadataQueryHandler, "metadataQueryHandler is null");
         this.sessionRegistry = requireNonNull(sessionRegistry, "sessionRegistry is null");
         this.config = requireNonNull(config, "config is null");
         this.stats = requireNonNull(stats, "stats is null");
@@ -101,6 +126,10 @@ public class MysqlCommandDispatcher
                 handleQuery(ctx, session, trimTrailingNul(MysqlPacketBuffer.readEofString(payload)));
                 return true;
             }
+            case COM_FIELD_LIST -> {
+                handleFieldList(ctx, session, MysqlPacketBuffer.readEofString(payload));
+                return true;
+            }
             case COM_SET_OPTION -> {
                 writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
                 return true;
@@ -134,28 +163,81 @@ public class MysqlCommandDispatcher
             writePacketAndFlush(ctx, new ErrPacket(1049, "42000", "Unknown database ''"));
             return;
         }
-        MysqlAuthenticator.CatalogSchema target = MysqlAuthenticator.resolveCatalogSchema(Optional.of(trimmed), config);
-        String useTarget;
-        if (target.catalog().isPresent() && target.schema().isPresent()) {
-            useTarget = quoteIdentifier(target.catalog().get()) + "." + quoteIdentifier(target.schema().get());
-        }
-        else if (target.schema().isPresent()) {
-            useTarget = quoteIdentifier(target.schema().get());
-        }
-        else {
-            writePacketAndFlush(ctx, new ErrPacket(1049, "42000", "Cannot resolve schema for database '" + trimmed + "'"));
+
+        List<String> parts = MysqlMetadataQueryHandler.splitQualifiedIdentifier(trimmed);
+        if (parts.size() >= 2) {
+            String useTarget = quoteIdentifier(parts.get(0)) + "." + quoteIdentifier(parts.get(1));
+            statementExecutor.executeInitDb(ctx, session, "USE " + useTarget);
             return;
         }
-        statementExecutor.executeInitDb(ctx, session, "USE " + useTarget);
+
+        String singleName = parts.get(0);
+        Optional<String> currentCatalog = session.clientSession().getCatalog()
+                .or(() -> Optional.ofNullable(config.getDefaultCatalog()).filter(s -> !s.isEmpty()));
+
+        if (currentCatalog.isPresent()) {
+            String useSql = "USE " + quoteIdentifier(currentCatalog.get()) + "." + quoteIdentifier(singleName);
+            Optional<TrinoErrorMapper.MysqlError> err = statementExecutor.tryExecuteInitDb(session, useSql);
+            if (err.isEmpty()) {
+                writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
+                return;
+            }
+            // Fallback: check if singleName is actually a catalog name
+            if (trySwitchToCatalog(session, singleName).isEmpty()) {
+                writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
+                return;
+            }
+            writePacketAndFlush(ctx, err.get().toErrPacket());
+            return;
+        }
+
+        // No current catalog set: interpret singleName as a catalog name
+        Optional<TrinoErrorMapper.MysqlError> catErr = trySwitchToCatalog(session, singleName);
+        if (catErr.isEmpty()) {
+            writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
+        }
+        else {
+            writePacketAndFlush(ctx, catErr.get().toErrPacket());
+        }
     }
 
-    private void handleQuery(ChannelHandlerContext ctx, MysqlSession session, String sql)
+    private Optional<TrinoErrorMapper.MysqlError> trySwitchToCatalog(MysqlSession session, String catalogName)
     {
-        Matcher killMatcher = KILL_PATTERN.matcher(sql.trim());
+        try {
+            InternalQueryResult res = statementExecutor.executeInternalQuery(
+                    session,
+                    "SHOW SCHEMAS FROM " + quoteIdentifier(catalogName));
+            List<String> schemas = new ArrayList<>(res.rows().size());
+            for (List<Object> row : res.rows()) {
+                if (!row.isEmpty() && row.get(0) != null) {
+                    schemas.add(String.valueOf(row.get(0)));
+                }
+            }
+            ClientSession.Builder builder = ClientSession.builder(session.clientSession())
+                    .catalog(catalogName);
+            if (!schemas.isEmpty()) {
+                builder.schema(MysqlMetadataQueryHandler.pickDefaultSchema(schemas));
+            }
+            else if (config.getDefaultSchema() != null && !config.getDefaultSchema().isEmpty()) {
+                builder.schema(config.getDefaultSchema());
+            }
+            session.setClientSession(builder.build());
+            return Optional.empty();
+        }
+        catch (MysqlQueryException e) {
+            return Optional.of(e.mysqlError());
+        }
+    }
+
+    private void handleQuery(ChannelHandlerContext ctx, MysqlSession session, String rawSql)
+    {
+        Matcher killMatcher = KILL_PATTERN.matcher(rawSql.trim());
         if (killMatcher.matches()) {
             handleKill(ctx, session, killMatcher.group(1), Integer.parseInt(killMatcher.group(2)));
             return;
         }
+
+        String sql = MysqlSqlPreprocessor.preprocess(rawSql);
 
         Optional<MysqlSystemVariableHandler.InterceptedResult> intercepted = systemVariableHandler.tryHandle(sql, session);
         if (intercepted.isPresent()) {
@@ -163,7 +245,60 @@ public class MysqlCommandDispatcher
             return;
         }
 
+        try {
+            Optional<MysqlSystemVariableHandler.InterceptedResult> metadataResult = metadataQueryHandler.tryHandle(sql, session);
+            if (metadataResult.isPresent()) {
+                writeInterceptedResult(ctx, session, metadataResult.get());
+                return;
+            }
+        }
+        catch (MysqlQueryException e) {
+            writePacketAndFlush(ctx, e.mysqlError().toErrPacket());
+            return;
+        }
+
+        // If client runs `USE <single_identifier>` when no session catalog is set, resolve catalog+schema
+        Matcher useSingleMatcher = USE_SINGLE_IDENTIFIER_PATTERN.matcher(sql.trim());
+        if (useSingleMatcher.matches() && session.clientSession().getCatalog().isEmpty()) {
+            handleInitDb(ctx, session, useSingleMatcher.group(1));
+            return;
+        }
+
         statementExecutor.executeQuery(ctx, session, sql);
+    }
+
+    private void handleFieldList(ChannelHandlerContext ctx, MysqlSession session, String payloadStr)
+    {
+        int nulIdx = payloadStr.indexOf('\0');
+        String tableName = (nulIdx >= 0 ? payloadStr.substring(0, nulIdx) : payloadStr).trim();
+        if (tableName.isEmpty()) {
+            writeFieldListEnd(ctx, session);
+            return;
+        }
+
+        try {
+            String qualified = MysqlMetadataQueryHandler.qualifyTableReference(tableName, Optional.empty());
+            InternalQueryResult res = statementExecutor.executeInternalQuery(session, "DESCRIBE " + qualified);
+            String schema = session.clientSession().getSchema().orElse("");
+            for (List<Object> row : res.rows()) {
+                String colName = !row.isEmpty() && row.get(0) != null ? String.valueOf(row.get(0)) : "";
+                writePacket(ctx, TrinoToMysqlTypeMapper.stringColumn(schema, tableName, colName));
+            }
+            writeFieldListEnd(ctx, session);
+        }
+        catch (MysqlQueryException e) {
+            writePacketAndFlush(ctx, e.mysqlError().toErrPacket());
+        }
+    }
+
+    private static void writeFieldListEnd(ChannelHandlerContext ctx, MysqlSession session)
+    {
+        if (session.capabilities().isDeprecatedEof()) {
+            writePacketAndFlush(ctx, new ResultSetEndPacket(session.serverStatusFlags(), 0));
+        }
+        else {
+            writePacketAndFlush(ctx, new EofPacket(0, session.serverStatusFlags()));
+        }
     }
 
     private void handleKill(ChannelHandlerContext ctx, MysqlSession session, String kind, int targetId)
@@ -241,10 +376,5 @@ public class MysqlCommandDispatcher
             end--;
         }
         return s.substring(0, end);
-    }
-
-    private static String quoteIdentifier(String identifier)
-    {
-        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 }

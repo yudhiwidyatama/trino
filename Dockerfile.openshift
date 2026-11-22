@@ -22,6 +22,11 @@ RUN set -xeuo pipefail && \
         -Dskip.npm=true \
         -pl client/trino-cli,core/trino-server-main,service/trino-mysql-proxy,plugin/trino-exchange-filesystem,plugin/trino-hive,lib/trino-hdfs,plugin/trino-iceberg,plugin/trino-jmx,plugin/trino-memory,plugin/trino-mysql,plugin/trino-oracle,plugin/trino-password-authenticators,plugin/trino-postgresql,plugin/trino-resource-group-managers,plugin/trino-session-property-managers,plugin/trino-tpcds,plugin/trino-tpch \
         -am && \
+    # Run unit tests for lib/trino-mysql-protocol
+    ./mvnw -B test \
+        -Dair.check.skip-all=true \
+        -Dmaven.gitcommitid.skip=true \
+        -pl lib/trino-mysql-protocol && \
     # Step 2: Assemble trino-server-455-SNAPSHOT.tar.gz via provisio after all plugins are in local m2
     ./mvnw -B package \
         -DskipTests \

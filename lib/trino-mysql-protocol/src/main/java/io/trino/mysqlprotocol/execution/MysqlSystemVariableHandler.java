@@ -30,29 +30,43 @@ import java.util.regex.Pattern;
 import static java.util.Objects.requireNonNull;
 
 /**
- * Intercepts MySQL client/driver initialization probes (such as Connector/J's {@code SELECT @@...},
- * {@code SET NAMES}, {@code SHOW VARIABLES}, and {@code SELECT DATABASE()}) so standard MySQL drivers
- * can connect to Trino seamlessly without SQL syntax errors.
+ * Intercepts MySQL client/driver/GUI initialization probes (such as Connector/J and Sequel Pro's
+ * {@code SELECT @@...}, {@code SET NAMES}, {@code SHOW VARIABLES}, {@code SHOW STATUS},
+ * {@code SHOW ENGINES}, {@code SHOW CHARACTER SET}, {@code SHOW INDEX}, {@code SHOW TRIGGERS},
+ * {@code SHOW PROCEDURE/FUNCTION STATUS}, and {@code SELECT DATABASE()}) so standard MySQL drivers
+ * and GUI tools can connect to Trino seamlessly without SQL syntax errors.
  */
 public class MysqlSystemVariableHandler
 {
     private static final Pattern LEADING_BLOCK_COMMENT = Pattern.compile("^\\s*(/\\*.*?\\*/\\s*)+", Pattern.DOTALL);
     private static final Pattern SELECT_SYSVARS = Pattern.compile("^SELECT\\s+(.+?)(?:\\s+LIMIT\\s+\\d+)?\\s*;?$", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern SYSVAR_ITEM = Pattern.compile(
-            "^@@(?:(?:SESSION|GLOBAL|LOCAL)\\.)?([A-Za-z0-9_]+)(?:\\s+(?:AS\\s+)?`?([A-Za-z0-9_]+)`?)?$",
+            "^@@(?:(?:SESSION|GLOBAL|LOCAL)\\.)?([A-Za-z0-9_]+)(?:\\s+(?:AS\\s+)?[\"`']?([A-Za-z0-9_.]+)[\"`']?)?$",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern SET_TIME_ZONE = Pattern.compile(
             "^SET\\s+(?:(?:SESSION|LOCAL|@@SESSION\\.|@@)\\s*)?time_zone\\s*=\\s*['\"]?([^'\";]+)['\"]?\\s*;?$",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern MYSQL_COMPAT_SET = Pattern.compile(
-            "^SET\\s+(?:NAMES\\b|CHARACTER\\s+SET\\b|(?:SESSION\\s+|LOCAL\\s+|@@SESSION\\.|@@)?(?:character_set_results|character_set_client|character_set_connection|collation_connection|sql_mode|autocommit|net_write_timeout|net_read_timeout|wait_timeout|interactive_timeout|transaction_isolation|tx_isolation|sql_select_limit|max_execution_time|SESSION\\s+TRANSACTION)\\b).*",
+            "^SET\\s+(?:NAMES\\b|CHARACTER\\s+SET\\b|(?:GLOBAL\\s+|SESSION\\s+|LOCAL\\s+|@@GLOBAL\\.|@@SESSION\\.|@@)?(?:character_set_results|character_set_client|character_set_connection|collation_connection|sql_mode|autocommit|net_write_timeout|net_read_timeout|wait_timeout|interactive_timeout|transaction_isolation|tx_isolation|transaction_read_only|tx_read_only|sql_select_limit|max_execution_time|profiling|FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|SQL_AUTO_IS_NULL|SESSION\\s+TRANSACTION)\\b).*",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern SHOW_VARIABLES = Pattern.compile(
-            "^SHOW\\s+(?:(?:SESSION|GLOBAL)\\s+)?VARIABLES(?:\\s+LIKE\\s+'([^']*)')?\\s*;?$",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern SHOW_COLLATION = Pattern.compile("^SHOW\\s+COLLATION\\b.*", Pattern.CASE_INSENSITIVE);
-    private static final Pattern SELECT_DATABASE = Pattern.compile("^SELECT\\s+DATABASE\\(\\)\\s*;?$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern SELECT_VERSION = Pattern.compile("^SELECT\\s+VERSION\\(\\)\\s*;?$", Pattern.CASE_INSENSITIVE);
+            "^SHOW\\s+(?:(?:SESSION|GLOBAL)\\s+)?VARIABLES(?:\\s+LIKE\\s+'([^']*)'|\\s+WHERE\\s+.*)?\\s*;?$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_STATUS = Pattern.compile(
+            "^SHOW\\s+(?:(?:SESSION|GLOBAL)\\s+)?STATUS(?:\\s+LIKE\\s+'([^']*)'|\\s+WHERE\\s+.*)?\\s*;?$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_COLLATION = Pattern.compile("^SHOW\\s+COLLATION\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_CHARSET = Pattern.compile("^SHOW\\s+(?:CHARACTER\\s+SET|CHARSET)\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_ENGINES = Pattern.compile("^SHOW\\s+(?:STORAGE\\s+)?ENGINES\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_GRANTS = Pattern.compile("^SHOW\\s+GRANTS\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_INDEX = Pattern.compile("^SHOW\\s+(?:EXTENDED\\s+)?(?:FULL\\s+)?(?:INDEX|INDEXES|KEYS)\\s+(?:FROM|IN)\\s+.+", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_TRIGGERS = Pattern.compile("^SHOW\\s+TRIGGERS\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_ROUTINE_STATUS = Pattern.compile("^SHOW\\s+(?:PROCEDURE|FUNCTION)\\s+STATUS\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SHOW_WARNINGS_ERRORS = Pattern.compile("^SHOW\\s+(?:WARNINGS|ERRORS)\\b.*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SELECT_DATABASE = Pattern.compile("^SELECT\\s+DATABASE\\(\\)(?:\\s+(?:AS\\s+)?[\"`']?([^\"`';\\s]+)[\"`']?)?\\s*;?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SELECT_VERSION = Pattern.compile("^SELECT\\s+VERSION\\(\\)(?:\\s+(?:AS\\s+)?[\"`']?([^\"`';\\s]+)[\"`']?)?\\s*;?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SELECT_CONNECTION_ID = Pattern.compile("^SELECT\\s+CONNECTION_ID\\(\\)(?:\\s+(?:AS\\s+)?[\"`']?([^\"`';\\s]+)[\"`']?)?\\s*;?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SELECT_CURRENT_USER = Pattern.compile("^SELECT\\s+(?:CURRENT_USER|USER|SESSION_USER)(?:\\(\\))?(?:\\s+(?:AS\\s+)?[\"`']?([^\"`';\\s]+)[\"`']?)?\\s*;?$", Pattern.CASE_INSENSITIVE);
 
     private final MysqlProtocolConfig config;
 
@@ -72,13 +86,30 @@ public class MysqlSystemVariableHandler
             return Optional.of(InterceptedResult.ok());
         }
 
-        if (SELECT_DATABASE.matcher(sql).matches()) {
+        Matcher dbMatcher = SELECT_DATABASE.matcher(sql);
+        if (dbMatcher.matches()) {
+            String col = dbMatcher.group(1) != null ? dbMatcher.group(1) : "DATABASE()";
             String db = formatDatabase(session.clientSession());
-            return Optional.of(InterceptedResult.resultSet(List.of("DATABASE()"), List.of(singletonRow(db))));
+            return Optional.of(InterceptedResult.resultSet(List.of(col), List.of(singletonRow(db))));
         }
 
-        if (SELECT_VERSION.matcher(sql).matches()) {
-            return Optional.of(InterceptedResult.resultSet(List.of("VERSION()"), List.of(List.of(config.getServerVersion()))));
+        Matcher verMatcher = SELECT_VERSION.matcher(sql);
+        if (verMatcher.matches()) {
+            String col = verMatcher.group(1) != null ? verMatcher.group(1) : "VERSION()";
+            return Optional.of(InterceptedResult.resultSet(List.of(col), List.of(List.of(config.getServerVersion()))));
+        }
+
+        Matcher connIdMatcher = SELECT_CONNECTION_ID.matcher(sql);
+        if (connIdMatcher.matches()) {
+            String col = connIdMatcher.group(1) != null ? connIdMatcher.group(1) : "CONNECTION_ID()";
+            return Optional.of(InterceptedResult.resultSet(List.of(col), List.of(List.of(String.valueOf(session.connectionId())))));
+        }
+
+        Matcher userMatcher = SELECT_CURRENT_USER.matcher(sql);
+        if (userMatcher.matches()) {
+            String col = userMatcher.group(1) != null ? userMatcher.group(1) : "CURRENT_USER()";
+            String user = session.clientSession().getUser().orElse("trino") + "@%";
+            return Optional.of(InterceptedResult.resultSet(List.of(col), List.of(List.of(user))));
         }
 
         Matcher tzMatcher = SET_TIME_ZONE.matcher(sql);
@@ -99,11 +130,105 @@ public class MysqlSystemVariableHandler
             return Optional.of(handleShowVariables(likePattern, session));
         }
 
+        Matcher showStatusMatcher = SHOW_STATUS.matcher(sql);
+        if (showStatusMatcher.matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of("Variable_name", "Value"),
+                    List.of(
+                            List.of("Threads_connected", "1"),
+                            List.of("Uptime", "3600"),
+                            List.of("Questions", "1"),
+                            List.of("Queries", "1"))));
+        }
+
         if (SHOW_COLLATION.matcher(sql).matches()) {
             return Optional.of(InterceptedResult.resultSet(
                     List.of("Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"),
-                    List.of(List.of("utf8mb4_0900_ai_ci", "utf8mb4", "255", "Yes", "Yes", "0", "NO PAD"),
-                            List.of("utf8mb4_general_ci", "utf8mb4", "45", "", "Yes", "1", "PAD SPACE"))));
+                    List.of(
+                            List.of("utf8mb4_0900_ai_ci", "utf8mb4", "255", "Yes", "Yes", "0", "NO PAD"),
+                            List.of("utf8mb4_general_ci", "utf8mb4", "45", "", "Yes", "1", "PAD SPACE"),
+                            List.of("utf8_general_ci", "utf8", "33", "Yes", "Yes", "1", "PAD SPACE"))));
+        }
+
+        if (SHOW_CHARSET.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of("Charset", "Description", "Default collation", "Maxlen"),
+                    List.of(
+                            List.of("utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", "4"),
+                            List.of("utf8", "UTF-8 Unicode", "utf8_general_ci", "3"),
+                            List.of("latin1", "cp1252 West European", "latin1_swedish_ci", "1"))));
+        }
+
+        if (SHOW_ENGINES.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of("Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"),
+                    List.of(List.of("InnoDB", "DEFAULT", "Supports transactions, row-level locking, and foreign keys", "YES", "YES", "YES"))));
+        }
+
+        if (SHOW_GRANTS.matcher(sql).matches()) {
+            String user = session.clientSession().getUser().orElse("trino");
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of("Grants for " + user + "@%"),
+                    List.of(List.of("GRANT ALL PRIVILEGES ON *.* TO `" + user + "`@`%`"))));
+        }
+
+        if (SHOW_INDEX.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of(
+                            "Table",
+                            "Non_unique",
+                            "Key_name",
+                            "Seq_in_index",
+                            "Column_name",
+                            "Collation",
+                            "Cardinality",
+                            "Sub_part",
+                            "Packed",
+                            "Null",
+                            "Index_type",
+                            "Comment",
+                            "Index_comment"),
+                    List.of()));
+        }
+
+        if (SHOW_TRIGGERS.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of(
+                            "Trigger",
+                            "Event",
+                            "Table",
+                            "Statement",
+                            "Timing",
+                            "Created",
+                            "sql_mode",
+                            "Definer",
+                            "character_set_client",
+                            "collation_connection",
+                            "Database Collation"),
+                    List.of()));
+        }
+
+        if (SHOW_ROUTINE_STATUS.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of(
+                            "Db",
+                            "Name",
+                            "Type",
+                            "Definer",
+                            "Modified",
+                            "Created",
+                            "Security_type",
+                            "Comment",
+                            "character_set_client",
+                            "collation_connection",
+                            "Database Collation"),
+                    List.of()));
+        }
+
+        if (SHOW_WARNINGS_ERRORS.matcher(sql).matches()) {
+            return Optional.of(InterceptedResult.resultSet(
+                    List.of("Level", "Code", "Message"),
+                    List.of()));
         }
 
         Matcher selectMatcher = SELECT_SYSVARS.matcher(sql);
@@ -143,10 +268,17 @@ public class MysqlSystemVariableHandler
                 "auto_increment_increment",
                 "character_set_client",
                 "character_set_connection",
+                "character_set_database",
+                "character_set_filesystem",
                 "character_set_results",
                 "character_set_server",
+                "character_set_system",
                 "collation_connection",
+                "collation_database",
                 "collation_server",
+                "have_openssl",
+                "have_ssl",
+                "hostname",
                 "init_connect",
                 "interactive_timeout",
                 "license",
@@ -155,6 +287,7 @@ public class MysqlSystemVariableHandler
                 "net_buffer_length",
                 "net_write_timeout",
                 "performance_schema",
+                "protocol_version",
                 "query_cache_size",
                 "query_cache_type",
                 "sql_mode",
@@ -164,6 +297,8 @@ public class MysqlSystemVariableHandler
                 "tx_isolation",
                 "version",
                 "version_comment",
+                "version_compile_machine",
+                "version_compile_os",
                 "wait_timeout");
 
         Pattern regex = likePattern == null ? null : sqlLikeToRegex(likePattern);
@@ -180,12 +315,16 @@ public class MysqlSystemVariableHandler
     {
         return switch (varName.toLowerCase(Locale.ROOT)) {
             case "auto_increment_increment" -> "1";
-            case "character_set_client", "character_set_connection", "character_set_results", "character_set_server" -> "utf8mb4";
-            case "collation_connection", "collation_server" -> "utf8mb4_0900_ai_ci";
+            case "character_set_client", "character_set_connection", "character_set_database", "character_set_results", "character_set_server", "character_set_system" -> "utf8mb4";
+            case "character_set_filesystem" -> "binary";
+            case "collation_connection", "collation_database", "collation_server" -> "utf8mb4_0900_ai_ci";
+            case "have_openssl", "have_ssl" -> config.isTlsEnabled() ? "YES" : "DISABLED";
+            case "hostname" -> "trino-coordinator";
             case "max_allowed_packet" -> String.valueOf(config.getMaxAllowedPacket().toBytes());
             case "net_buffer_length" -> "16384";
             case "net_write_timeout", "net_read_timeout" -> "60";
             case "interactive_timeout", "wait_timeout" -> String.valueOf((long) config.getIdleTimeout().getValue(java.util.concurrent.TimeUnit.SECONDS));
+            case "protocol_version" -> "10";
             case "system_time_zone" -> ZoneId.systemDefault().getId();
             case "time_zone" -> session.clientSession().getTimeZone().getId();
             case "transaction_isolation", "tx_isolation" -> "READ-COMMITTED";
@@ -195,6 +334,8 @@ public class MysqlSystemVariableHandler
             case "license" -> "Apache-2.0";
             case "version" -> config.getServerVersion();
             case "version_comment" -> "Trino MySQL Protocol";
+            case "version_compile_machine" -> "x86_64";
+            case "version_compile_os" -> "Linux";
             case "autocommit" -> "1";
             default -> "";
         };

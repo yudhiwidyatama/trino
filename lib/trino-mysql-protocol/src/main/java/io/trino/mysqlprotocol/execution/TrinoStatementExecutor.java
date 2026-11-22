@@ -34,7 +34,9 @@ import io.trino.mysqlprotocol.session.TrinoClientFactory;
 import io.trino.mysqlprotocol.session.TrinoSessionSynchronizer;
 import okhttp3.OkHttpClient;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
 
@@ -161,6 +163,16 @@ public class TrinoStatementExecutor
 
     public void executeInitDb(ChannelHandlerContext ctx, MysqlSession session, String useSql)
     {
+        Optional<TrinoErrorMapper.MysqlError> error = tryExecuteInitDb(session, useSql);
+        if (error.isPresent()) {
+            writePacketAndFlush(ctx, error.get().toErrPacket());
+            return;
+        }
+        writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
+    }
+
+    public Optional<TrinoErrorMapper.MysqlError> tryExecuteInitDb(MysqlSession session, String useSql)
+    {
         OkHttpClient httpClient = clientFactory.clientFor(session);
         try (StatementClient client = StatementClientFactory.newStatementClient(httpClient, session.clientSession(), useSql)) {
             session.setActiveStatement(client);
@@ -170,16 +182,85 @@ public class TrinoStatementExecutor
             TrinoSessionSynchronizer.synchronize(session, client);
             QueryStatusInfo finalStatus = client.finalStatusInfo();
             if (client.isClientError() || finalStatus.getError() != null) {
-                writePacketAndFlush(ctx, TrinoErrorMapper.fromQueryError(finalStatus.getError()).toErrPacket());
-                return;
+                return Optional.of(TrinoErrorMapper.fromQueryError(finalStatus.getError()));
             }
-            writePacketAndFlush(ctx, new OkPacket(0, 0, session.serverStatusFlags(), 0, "", session.capabilities().flags()));
+            return Optional.empty();
         }
         catch (Throwable t) {
-            writePacketAndFlush(ctx, TrinoErrorMapper.fromThrowable(t).toErrPacket());
+            return Optional.of(TrinoErrorMapper.fromThrowable(t));
         }
         finally {
             session.clearActiveStatement();
+        }
+    }
+
+    public InternalQueryResult executeInternalQuery(MysqlSession session, String sql)
+    {
+        stats.queryStarted();
+        OkHttpClient httpClient = clientFactory.clientFor(session);
+        List<Column> columns = List.of();
+        List<List<Object>> rows = new ArrayList<>();
+
+        try (StatementClient client = StatementClientFactory.newStatementClient(httpClient, session.clientSession(), sql)) {
+            session.setActiveStatement(client);
+            while (client.isRunning()) {
+                QueryStatusInfo statusInfo = client.currentStatusInfo();
+                if (columns.isEmpty() && statusInfo.getColumns() != null && !statusInfo.getColumns().isEmpty()) {
+                    columns = statusInfo.getColumns();
+                }
+                QueryData data = client.currentData();
+                if (data != null && data.getData() != null) {
+                    for (List<Object> row : data.getData()) {
+                        rows.add(row);
+                    }
+                }
+                client.advance();
+            }
+
+            TrinoSessionSynchronizer.synchronize(session, client);
+
+            QueryStatusInfo finalStatus = client.finalStatusInfo();
+            if (client.isClientAborted()) {
+                stats.queryFailed();
+                throw new MysqlQueryException(new TrinoErrorMapper.MysqlError(1317, "70100", "Query execution was interrupted"));
+            }
+            if (client.isClientError() || finalStatus.getError() != null) {
+                stats.queryFailed();
+                throw new MysqlQueryException(TrinoErrorMapper.fromQueryError(finalStatus.getError()));
+            }
+            if (columns.isEmpty() && finalStatus.getColumns() != null) {
+                columns = finalStatus.getColumns();
+            }
+            return new InternalQueryResult(columns, rows);
+        }
+        catch (MysqlQueryException e) {
+            throw e;
+        }
+        catch (Throwable t) {
+            stats.queryFailed();
+            throw new MysqlQueryException(TrinoErrorMapper.fromThrowable(t));
+        }
+        finally {
+            session.clearActiveStatement();
+        }
+    }
+
+    public record InternalQueryResult(List<Column> columns, List<List<Object>> rows) {}
+
+    public static class MysqlQueryException
+            extends RuntimeException
+    {
+        private final TrinoErrorMapper.MysqlError mysqlError;
+
+        public MysqlQueryException(TrinoErrorMapper.MysqlError mysqlError)
+        {
+            super(mysqlError.message());
+            this.mysqlError = requireNonNull(mysqlError, "mysqlError is null");
+        }
+
+        public TrinoErrorMapper.MysqlError mysqlError()
+        {
+            return mysqlError;
         }
     }
 

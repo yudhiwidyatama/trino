@@ -226,6 +226,94 @@ class TestMysqlProtocolWithMockTrino
         assertThat(insertReq.getHeader("X-Trino-Schema")).isEqualTo("default");
     }
 
+    @Test
+    void testSequelProBackquotedQueriesAndMetadataCompatibility()
+            throws Exception
+    {
+        String showTablesResponse = """
+                {
+                  "id": "q_tables",
+                  "infoUri": "http://localhost/ui/query.html?q_tables",
+                  "columns": [{"name": "Table", "type": "varchar", "typeSignature": {"rawType": "varchar", "arguments": []}}],
+                  "data": [["nation"], ["region"]],
+                  "stats": {"state": "FINISHED", "queued": false, "scheduled": true, "nodes": 1, "totalSplits": 1, "queuedSplits": 0, "runningSplits": 0, "completedSplits": 1, "cpuTimeMillis": 1, "wallTimeMillis": 1, "queuedTimeMillis": 0, "elapsedTimeMillis": 1, "processedRows": 2, "processedBytes": 20, "physicalInputBytes": 0, "peakMemoryBytes": 0, "spilledBytes": 0}
+                }
+                """;
+        String describeResponse = """
+                {
+                  "id": "q_desc",
+                  "infoUri": "http://localhost/ui/query.html?q_desc",
+                  "columns": [
+                    {"name": "Column", "type": "varchar", "typeSignature": {"rawType": "varchar", "arguments": []}},
+                    {"name": "Type", "type": "varchar", "typeSignature": {"rawType": "varchar", "arguments": []}},
+                    {"name": "Extra", "type": "varchar", "typeSignature": {"rawType": "varchar", "arguments": []}},
+                    {"name": "Comment", "type": "varchar", "typeSignature": {"rawType": "varchar", "arguments": []}}
+                  ],
+                  "data": [
+                    ["nationkey", "bigint", "", ""],
+                    ["name", "varchar(25)", "", ""]
+                  ],
+                  "stats": {"state": "FINISHED", "queued": false, "scheduled": true, "nodes": 1, "totalSplits": 1, "queuedSplits": 0, "runningSplits": 0, "completedSplits": 1, "cpuTimeMillis": 1, "wallTimeMillis": 1, "queuedTimeMillis": 0, "elapsedTimeMillis": 1, "processedRows": 2, "processedBytes": 20, "physicalInputBytes": 0, "peakMemoryBytes": 0, "spilledBytes": 0}
+                }
+                """;
+        String selectResponse = """
+                {
+                  "id": "q_sel",
+                  "infoUri": "http://localhost/ui/query.html?q_sel",
+                  "columns": [
+                    {"name": "nationkey", "type": "bigint", "typeSignature": {"rawType": "bigint", "arguments": []}},
+                    {"name": "name", "type": "varchar(25)", "typeSignature": {"rawType": "varchar", "arguments": [{"kind": "LONG", "value": 25}]}}
+                  ],
+                  "data": [[0, "ALGERIA"]],
+                  "stats": {"state": "FINISHED", "queued": false, "scheduled": true, "nodes": 1, "totalSplits": 1, "queuedSplits": 0, "runningSplits": 0, "completedSplits": 1, "cpuTimeMillis": 1, "wallTimeMillis": 1, "queuedTimeMillis": 0, "elapsedTimeMillis": 1, "processedRows": 1, "processedBytes": 10, "physicalInputBytes": 0, "peakMemoryBytes": 0, "spilledBytes": 0}
+                }
+                """;
+
+        mockTrino.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(showTablesResponse));
+        mockTrino.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(describeResponse));
+        mockTrino.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(describeResponse));
+        mockTrino.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(selectResponse));
+
+        try (Connection conn = openConnection("tpch.tiny");
+                Statement stmt = conn.createStatement()) {
+            try (ResultSet rs = stmt.executeQuery("SHOW FULL TABLES FROM `tiny`")) {
+                assertThat(rs.getMetaData().getColumnCount()).isEqualTo(2);
+                assertThat(rs.getMetaData().getColumnLabel(1)).isEqualTo("Tables_in_tiny");
+                assertThat(rs.getMetaData().getColumnLabel(2)).isEqualTo("Table_type");
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getString(1)).isEqualTo("nation");
+                assertThat(rs.getString(2)).isEqualTo("BASE TABLE");
+            }
+
+            try (ResultSet rs = stmt.executeQuery("SHOW CREATE TABLE `nation`")) {
+                assertThat(rs.getMetaData().getColumnCount()).isEqualTo(2);
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getString("Table")).isEqualTo("nation");
+                assertThat(rs.getString("Create Table"))
+                        .contains("CREATE TABLE `nation`")
+                        .contains("`nationkey` bigint(20) DEFAULT NULL")
+                        .contains("`name` varchar(25) DEFAULT NULL");
+            }
+
+            try (ResultSet rs = stmt.executeQuery("SHOW FULL COLUMNS FROM `nation`")) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getString("Field")).isEqualTo("nationkey");
+                assertThat(rs.getString("Type")).isEqualTo("bigint(20)");
+            }
+
+            try (ResultSet rs = stmt.executeQuery("SELECT `nationkey`, `name` FROM `nation` LIMIT 0, 1000;")) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getLong(1)).isEqualTo(0L);
+                assertThat(rs.getString(2)).isEqualTo("ALGERIA");
+            }
+        }
+
+        assertThat(readBody(mockTrino.takeRequest())).isEqualTo("SHOW TABLES FROM \"tpch\".\"tiny\"");
+        assertThat(readBody(mockTrino.takeRequest())).isEqualTo("DESCRIBE \"nation\"");
+        assertThat(readBody(mockTrino.takeRequest())).isEqualTo("DESCRIBE \"nation\"");
+        assertThat(readBody(mockTrino.takeRequest())).isEqualTo("SELECT \"nationkey\", \"name\" FROM \"nation\" OFFSET 0 LIMIT 1000");
+    }
+
     @SuppressWarnings("deprecation")
     private static String readBody(RecordedRequest request)
     {

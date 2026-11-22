@@ -16,7 +16,9 @@
 - [x] Step 7: Verified rollout (`1/1` coordinator + `3/3` workers `active` in `system.runtime.nodes`), all 25 catalogs (`24` configured + `system`), and MySQL wire protocol listener on port `3306` (`8.0.32-trino` handshake)
 
 ### In Progress / Pending
-- *(None — all planned steps completed)*
+- [ ] Step 8: Implement `MysqlSqlPreprocessor` (backquoted identifiers `` `...` `` -> `"..."`, `#` comments -> `--`, `LIMIT offset, count` -> `OFFSET offset LIMIT count`) and Sequel Pro / MySQL GUI metadata query compatibility (`SHOW DATABASES`, `SHOW [FULL] TABLES`, `SHOW TABLE STATUS`, `SHOW [FULL] COLUMNS/FIELDS`, `SHOW CREATE TABLE`, `SHOW INDEX/KEYS`, `SHOW ENGINES/TRIGGERS/PROCEDURE STATUS/FUNCTION STATUS`) in `lib/trino-mysql-protocol`
+- [ ] Step 9: Run unit tests for `lib/trino-mysql-protocol`, commit, and push to `mysql-protocol-proxy-plan` on GitLab
+- [ ] Step 10: Trigger OpenShift build (`oc48 start-build trino-mysql-proxy --follow`) and roll out updated `trino:455-mysql-proxy` image to `trino-chart-coordinator` and `trino-chart-worker`
 
 ---
 
@@ -67,6 +69,29 @@ Export live YAML manifests from namespace `epd-financeapps` into `openshift-back
 - Verify `oc48 rollout status` for `trino-chart-coordinator` and `trino-chart-worker`.
 - Verify `/v1/info` reports `455-SNAPSHOT`, `system.runtime.nodes` shows 1 coordinator + 3 workers `active`, `SHOW CATALOGS` lists all 24 catalogs, and port `3306` responds with the `8.0.32-trino` MySQL handshake packet.
 - Update the Progress section above.
+
+### Step 8: Implement SQL Preprocessor & Sequel Pro GUI Metadata Compatibility
+- **`MysqlSqlPreprocessor`**:
+  - Single-pass lexical state machine that safely converts MySQL backquoted identifiers `` `ident` `` (with `` `` `` unescaping and `"` -> `""` escaping) into ANSI double-quoted identifiers `"ident"`, while preserving single-quoted strings (`'...'`), double-quoted identifiers (`"..."`), `--` line comments, and `/* ... */` block comments.
+  - Converts MySQL `# ...` line comments (outside strings/identifiers) into ANSI `-- ...` line comments.
+  - Rewrites MySQL two-argument pagination `LIMIT <offset>, <count>` into Trino ANSI `OFFSET <offset> LIMIT <count>`.
+- **Sequel Pro & MySQL GUI Metadata Compatibility (`MysqlMetadataQueryHandler` / `MysqlSystemVariableHandler` / `MysqlCommandDispatcher`)**:
+  - `SHOW DATABASES` / `SHOW SCHEMAS`: Lists schemas in the current/default catalog (or catalogs if no catalog is selected), returning column `Database`.
+  - `SHOW [FULL] TABLES [FROM/IN db] [LIKE '...']`: Queries Trino `SHOW TABLES` and returns `Tables_in_<db>` (plus `Table_type = 'BASE TABLE'` when `FULL` is specified).
+  - `SHOW TABLE STATUS [FROM/IN db] [LIKE '...' | WHERE ...]`: Queries Trino `SHOW TABLES` and returns standard MySQL `SHOW TABLE STATUS` columns (`Name`, `Engine`, `Version`, `Row_format`, `Rows`, `Avg_row_length`, `Data_length`, `Max_data_length`, `Index_length`, `Data_free`, `Auto_increment`, `Create_time`, `Update_time`, `Check_time`, `Collation`, `Checksum`, `Create_options`, `Comment`) so Sequel Pro's sidebar and table info view load cleanly.
+  - `SHOW [FULL] COLUMNS/FIELDS FROM tbl [FROM/IN db]`: Executes Trino `DESCRIBE` and maps columns to MySQL's `Field`, `Type`, `Collation`, `Null`, `Key`, `Default`, `Extra`, `Privileges`, `Comment`.
+  - `SHOW CREATE TABLE tbl`: Executes Trino `SHOW CREATE TABLE` and returns the 2-column MySQL result (`Table`, `Create Table`).
+  - `SHOW INDEX/INDEXES/KEYS FROM tbl`, `SHOW TRIGGERS`, `SHOW ENGINES`, `SHOW STATUS`, `SHOW PROCEDURE STATUS`, `SHOW FUNCTION STATUS`, `SHOW WARNINGS`, `SHOW ERRORS`: Returns valid MySQL column headers (and empty or synthetic rows) so Sequel Pro's structure/triggers/indexes tabs do not error out.
+  - `COM_FIELD_LIST`: Translates legacy MySQL `COM_FIELD_LIST` (`0x04`) into Trino `DESCRIBE` column definitions.
+
+### Step 9: Unit Tests, Git Commit & Push
+- Add comprehensive unit tests for `MysqlSqlPreprocessor` and Sequel Pro metadata query handling in `lib/trino-mysql-protocol`.
+- Run `mvn test -pl lib/trino-mysql-protocol`.
+- Commit and push to `mysql-protocol-proxy-plan` on `yudhiremote` (`https://gitlab.telkom.co.id/dit-epd/big-data/trino.git`).
+
+### Step 10: OpenShift Build & Rollout
+- Run `oc48 start-build trino-mysql-proxy --follow` in namespace `epd-financeapps`.
+- Roll out the updated image to `deployment/trino-chart-coordinator` and `deployment/trino-chart-worker` and verify with MySQL backquoted queries and Sequel Pro metadata commands.
 
 ---
 
